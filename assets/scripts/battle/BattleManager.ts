@@ -21,7 +21,7 @@
  */
 
 import {
-  _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Color, Vec3, Label,
+  _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Vec3,
   input, Input, EventTouch, EventMouse, director,
 } from 'cc';
 import { GameConfig } from '../core/GameConfig';
@@ -36,7 +36,6 @@ import type { PlayerSaveData } from '../save/PlayerSaveData';
 import { AssetConfig, enemyAsset } from '../art/AssetConfig';
 import type { SpriteAsset } from '../art/AssetConfig';
 import { AssetLoader } from '../art/AssetLoader';
-import { hexToColor } from '../art/colorUtil';
 import { ArrowPool } from '../projectile/ArrowPool';
 import type { Arrow } from '../projectile/Arrow';
 import { MonsterSpawner } from './MonsterSpawner';
@@ -47,6 +46,10 @@ import { ArcherController } from '../player/ArcherController';
 import { ResultPanel } from '../ui/ResultPanel';
 import { UpgradePanel } from '../ui/UpgradePanel';
 import type { UpgradeRowData } from '../ui/UpgradePanel';
+import { BattleUI } from '../ui/BattleUI';
+import { PausePanel } from '../ui/PausePanel';
+import { DamageTextPool } from '../ui/DamageText';
+import { GoldPopupTextPool } from '../ui/GoldPopupText';
 import { LevelManager, LevelState } from '../level/LevelManager';
 import { WaveManager } from '../level/WaveManager';
 
@@ -79,6 +82,10 @@ export class BattleManager extends Component {
   private readonly frames = new Map<string, SpriteFrame | null>();
   private ui!: UITransform; // this.node's transform; tap conversion uses it
 
+  // --- floating combat FX (pooled; built over the battlefield) ---
+  private damageTexts!: DamageTextPool;
+  private goldPopups!: GoldPopupTextPool;
+
   // --- active entities (the per-frame battle path) ---
   private readonly arrows: Arrow[] = [];
   private readonly monsters: Monster[] = [];
@@ -95,13 +102,11 @@ export class BattleManager extends Component {
 
   private booted = false;
   private over = false;   // latched on defeat: stops spawning, movement, and firing
-  private paused = false; // true while the between-level UpgradePanel is up
-  private goldLabel: Label | null = null;
-  private castleHpLabel: Label | null = null;
-  private levelLabel: Label | null = null;
-  private waveLabel: Label | null = null;
+  private paused = false; // true while a modal overlay (UpgradePanel or PausePanel) is up
+  private battleUI: BattleUI | null = null;
   private upgradePanel: UpgradePanel | null = null;
   private upgradePanelNode: Node | null = null;
+  private pauseMenuNode: Node | null = null;
 
   // Per-run tallies shown on the result screen (reset every battle).
   private runKills = 0;
@@ -140,8 +145,10 @@ export class BattleManager extends Component {
 
     // --- preload real art, then build the scene ---
     await this.preloadArt();
-    const { monsterLayer, arrowLayer } = this.buildField();
-    this.buildHud();
+    const { monsterLayer, arrowLayer, fxLayer } = this.buildField();
+    this.damageTexts = new DamageTextPool(fxLayer);
+    this.goldPopups = new GoldPopupTextPool(fxLayer);
+    this.buildBattleUi();
 
     // --- battle systems ---
     this.arrowPool = new ArrowPool(arrowLayer, this.frameOf(AssetConfig.tower.arrow));
@@ -202,6 +209,9 @@ export class BattleManager extends Component {
     if (due.length > 0) {
       for (const wave of due) this.spawner.spawnWave(wave);
       this.updateWaveHud();
+      // Mirror the live within-level wave onto the profile (coalesced flush).
+      this.profile.currentWave = this.levelManager.currentWaveInLevel;
+      this.saveDirty = true;
     }
     this.spawner.update(dt, this.onMonsterSpawned);
 
@@ -216,6 +226,7 @@ export class BattleManager extends Component {
     this.monsters.push(m);
     this.aliveMonsterCount += 1;
     this.totalSpawnedMonsterCount += 1;
+    this.battleUI?.refreshMonsterCount();
   };
 
   /**
@@ -282,21 +293,22 @@ export class BattleManager extends Component {
     eventBus.emit(GameEvent.GameOver, { result: 'lose' });
     console.log(`[BattleManager] DEFEAT level=${level} kills=${this.runKills} gold=${this.runGoldEarned}`);
 
-    this.showResultPanel(level);
+    this.showResultPanel();
   }
 
-  /** Build and display the (simple) end-of-run summary overlay. */
-  private showResultPanel(level: number): void {
+  /** Build and display the end-of-run summary overlay (reads its numbers live). */
+  showResultPanel(): void {
     const node = new Node('ResultPanel');
     node.layer = Layers.Enum.UI_2D;
     this.node.addChild(node);
     const panel = node.addComponent(ResultPanel);
     panel.show({
-      level,
+      level: this.getCurrentLevel(),
       kills: this.runKills,
       goldEarned: this.runGoldEarned,
-      highestLevel: this.profile.highestLevel,
-      onRestart: () => this.restart(),
+      highestLevel: this.getBestLevel(),
+      onRestart: () => this.restartBattle(),
+      onReturnToMain: () => this.returnToMainMenu(),
     });
   }
 
@@ -312,8 +324,12 @@ export class BattleManager extends Component {
 
     const plan = this.levelManager.startLevel(); // starts the wave schedule (waves spawn over time)
     this.spawner.stop();             // drop any leftover spawn tasks
-    this.updateWaveHud();
     this.paused = false;
+    // A level always (re)starts at wave 1; keep the persisted wave in sync so a
+    // reload resumes the saved level at wave 1 (waves are time-scheduled, not
+    // resumed mid-level — see WavePlan in GameConfig).
+    this.profile.currentWave = this.levelManager.currentWaveInLevel;
+    this.battleUI?.refreshAll();
     console.log(`[BattleManager] startLevel ${plan.level} waves=${plan.totalWaves} monsters=${plan.totalCount} boss=${plan.hasBoss}`);
   }
 
@@ -334,7 +350,7 @@ export class BattleManager extends Component {
   }
 
   /** Build and display the between-level upgrade + continue overlay. */
-  private showUpgradePanel(): void {
+  showUpgradePanel(): void {
     const node = new Node('UpgradePanel');
     node.layer = Layers.Enum.UI_2D;
     this.node.addChild(node);
@@ -345,7 +361,7 @@ export class BattleManager extends Component {
       getGold: () => this.wallet.getGold(),
       getRows: () => this.buildUpgradeRows(),
       onBuy: (id) => this.buyUpgrade(id),
-      onContinue: () => this.continueToNextLevel(),
+      onContinue: () => this.continueNextWave(),
     });
   }
 
@@ -401,10 +417,99 @@ export class BattleManager extends Component {
     this.upgradePanel = null;
   }
 
-  /** Reload the scene for a fresh run (re-runs GameSceneController -> BattleManager). */
-  private restart(): void {
+  // --- public API (read by the UI; the UI never mutates core state) ---------
+
+  /** Current LEVEL (关) the player is on. */
+  getCurrentLevel(): number {
+    return this.levelManager?.currentLevel ?? this.profile.currentLevel;
+  }
+
+  /** Current WAVE (波) within the level, 1..wavesPerLevel. */
+  getCurrentWave(): number {
+    return this.levelManager?.currentWaveInLevel ?? this.profile.currentWave;
+  }
+
+  /** Waves per level (default 10). */
+  getWavesPerLevel(): number {
+    return this.levelManager?.wavesPerLevel ?? GameConfig.levelConfigs.wavesPerLevel;
+  }
+
+  getCurrentGold(): number {
+    return this.wallet.getGold();
+  }
+
+  getCastleHp(): number {
+    return this.castle?.currentHp ?? 0;
+  }
+
+  getCastleMaxHp(): number {
+    return this.castle?.maxHpValue ?? 0;
+  }
+
+  getKillCount(): number {
+    return this.runKills;
+  }
+
+  getAliveMonsterCount(): number {
+    return this.aliveMonsterCount;
+  }
+
+  /** Gold earned this run (shown on the result screen). */
+  getBattleEarnedGold(): number {
+    return this.runGoldEarned;
+  }
+
+  /** Best LEVEL (关) ever reached (persisted). */
+  getBestLevel(): number {
+    return this.profile.highestLevel;
+  }
+
+  /** Freeze the battle and pop the pause menu (no-op if over / already paused). */
+  pauseGame(): void {
+    if (!this.booted || this.over || this.paused) return;
+    this.paused = true;
+    this.firing = false;
+    eventBus.emit(GameEvent.GamePaused, {});
+
+    const node = new Node('PausePanel');
+    node.layer = Layers.Enum.UI_2D;
+    this.node.addChild(node);
+    this.pauseMenuNode = node;
+    node.addComponent(PausePanel).show({
+      onResume: () => this.resumeGame(),
+      onRestart: () => this.restartBattle(),
+      onReturnToMain: () => this.returnToMainMenu(),
+    });
+  }
+
+  /** Close the pause menu and resume the battle. */
+  resumeGame(): void {
+    if (this.over) return;
+    this.destroyPauseMenu();
+    this.paused = false;
+    eventBus.emit(GameEvent.GameResumed, {});
+  }
+
+  /** Reload the battle scene for a fresh run. */
+  restartBattle(): void {
     const scene = director.getScene();
     if (scene) director.loadScene(scene.name);
+  }
+
+  /** Advance to the next wave/level (closes the upgrade panel). */
+  continueNextWave(): void {
+    this.continueToNextLevel();
+  }
+
+  /** Persist progress and return to the main menu. */
+  returnToMainMenu(): void {
+    this.flushSave('return-main');
+    director.loadScene(GameConfig.scenes.main);
+  }
+
+  private destroyPauseMenu(): void {
+    this.pauseMenuNode?.destroy();
+    this.pauseMenuNode = null;
   }
 
   private stepArrowsAndCollide(dt: number): void {
@@ -427,8 +532,16 @@ export class BattleManager extends Component {
         const dx = px - m.positionX;
         const dy = py - m.positionY;
         if (dx * dx + dy * dy <= reach * reach) {
+          // Capture position + reward before the hit may recycle the monster.
+          const hitX = m.positionX;
+          const hitY = m.positionY + m.radius;
+          const reward = m.gold;
           const result = this.damageSystem.applyHit(m, arrow.damage);
-          if (result.killed) this.removeMonster(j);
+          this.damageTexts.show(hitX, hitY, result.dealt, result.crit);
+          if (result.killed) {
+            this.goldPopups.show(hitX, hitY + 24, reward);
+            this.removeMonster(j);
+          }
           this.removeArrow(i); // single-target, no pierce in MVP
           break;
         }
@@ -496,7 +609,7 @@ export class BattleManager extends Component {
 
   private onGoldChanged(p: { gold: number }): void {
     this.profile.gold = p.gold; // mirror only; the flush happens on a timer
-    if (this.goldLabel) this.goldLabel.string = `Gold: ${p.gold}`;
+    this.battleUI?.refreshGold();
   }
 
   private onMonsterKilled(p: { id: MonsterId; gold: number }): void {
@@ -510,22 +623,25 @@ export class BattleManager extends Component {
     // decided by checkLevelCompletion() once the field is empty.
     this.totalKilledMonsterCount += 1;
     this.aliveMonsterCount = Math.max(0, this.aliveMonsterCount - 1);
+
+    this.battleUI?.refreshKillCount();
+    this.battleUI?.refreshMonsterCount();
   }
 
-  private onLevelStarted(p: { level: number; totalWaves: number }): void {
-    if (this.levelLabel) this.levelLabel.string = `LEVEL ${p.level}`;
-    this.updateWaveHud();
+  private onLevelStarted(_p: { level: number; totalWaves: number }): void {
+    this.battleUI?.refreshWave();
+    this.battleUI?.refreshMonsterCount();
   }
 
-  /** Refresh the "WAVE w / N" HUD line from the level manager. */
+  /** Refresh the wave line on the HUD (driven by the level manager). */
   private updateWaveHud(): void {
-    if (this.waveLabel) {
-      this.waveLabel.string = `WAVE ${this.levelManager.currentWaveInLevel} / ${this.levelManager.wavesPerLevel}`;
-    }
+    this.battleUI?.refreshWave();
   }
 
   private onCastleHpChanged(p: { hp: number; maxHp: number }): void {
-    if (this.castleHpLabel) this.castleHpLabel.string = `Castle: ${p.hp} / ${p.maxHp}`;
+    // Pass the payload explicitly: during the Castle ctor `this.castle` is not
+    // yet assigned, so the HP getters would read stale/zero values here.
+    this.battleUI?.refreshCastleHp(p.hp, p.maxHp);
   }
 
   private tickSave(dt: number): void {
@@ -583,7 +699,7 @@ export class BattleManager extends Component {
   // --- scene construction ---------------------------------------------------
 
   /** Build background, ground, castle/archer art, and the pool layers. */
-  private buildField(): { monsterLayer: Node; arrowLayer: Node } {
+  private buildField(): { monsterLayer: Node; arrowLayer: Node; fxLayer: Node } {
     this.addSprite(AssetConfig.background.field, 0, 0, HALF_W * 2, HALF_H * 2);
 
     const groundY = GameConfig.layout.groundY - HALF_H;
@@ -599,18 +715,31 @@ export class BattleManager extends Component {
       56, 56,
     );
 
-    // Pool parents (kept above the field art).
+    // Pool parents (kept above the field art). FxLayer is last so damage / gold
+    // numbers draw over the monsters and arrows.
     const monsterLayer = this.addLayer('MonsterLayer');
     const arrowLayer = this.addLayer('ArrowLayer');
-    return { monsterLayer, arrowLayer };
+    const fxLayer = this.addLayer('FxLayer');
+    return { monsterLayer, arrowLayer, fxLayer };
   }
 
-  private buildHud(): void {
-    this.goldLabel = this.addLabel('Gold: 0', -HALF_W + 20, HALF_H - 30, 26, hexToColor(GameConfig.colors.damageCrit));
-    this.castleHpLabel = this.addLabel('Castle: -- / --', -HALF_W + 20, HALF_H - 64, 24, new Color(120, 220, 120));
-    this.levelLabel = this.addLabel('LEVEL --', -HALF_W + 20, HALF_H - 96, 20, new Color(230, 230, 230));
-    this.waveLabel = this.addLabel('WAVE -- / --', -HALF_W + 20, HALF_H - 124, 20, new Color(220, 200, 150));
-    this.addLabel('Hold the field to fire', -HALF_W + 20, HALF_H - 152, 18, new Color(200, 200, 200));
+  /** Attach the in-battle HUD and wire it to read state via the public getters. */
+  private buildBattleUi(): void {
+    const node = new Node('BattleUI');
+    node.layer = Layers.Enum.UI_2D;
+    this.node.addChild(node);
+    this.battleUI = node.addComponent(BattleUI);
+    this.battleUI.build({
+      getLevel: () => this.getCurrentLevel(),
+      getWave: () => this.getCurrentWave(),
+      getWavesPerLevel: () => this.getWavesPerLevel(),
+      getGold: () => this.getCurrentGold(),
+      getCastleHp: () => this.getCastleHp(),
+      getCastleMaxHp: () => this.getCastleMaxHp(),
+      getKills: () => this.getKillCount(),
+      getAliveMonsters: () => this.getAliveMonsterCount(),
+      onPause: () => this.pauseGame(),
+    });
   }
 
   private addLayer(name: string): Node {
@@ -635,22 +764,5 @@ export class BattleManager extends Component {
     this.node.addChild(node);
     node.setPosition(x, y, 0);
     return node;
-  }
-
-  private addLabel(text: string, x: number, y: number, size: number, col: Color): Label {
-    const node = new Node('label');
-    node.layer = Layers.Enum.UI_2D;
-    const ut = node.addComponent(UITransform);
-    ut.setContentSize(400, size * 1.4);
-    ut.setAnchorPoint(0, 0.5);
-    const label = node.addComponent(Label);
-    label.string = text;
-    label.fontSize = size;
-    label.lineHeight = size * 1.2;
-    label.color = col;
-    label.horizontalAlign = Label.HorizontalAlign.LEFT;
-    this.node.addChild(node);
-    node.setPosition(x, y, 0);
-    return label;
   }
 }

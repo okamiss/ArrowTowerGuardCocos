@@ -59,10 +59,11 @@ export interface UpgradePanelData {
 
 /** Internal handles kept per row so refresh() can update them in place. */
 interface RowView {
-  info: Label;     // "Damage  Lv.3"
-  cost: Label;     // "120 g" / "MAX"
+  info: Label;     // "箭矢伤害  Lv.3"
+  cost: Label;     // "升级价格：120" / "已达上限"
   buttonBg: Graphics;
-  enabled: boolean;
+  enabled: boolean; // affordable AND not maxed (button paints green, buy allowed)
+  maxed: boolean;   // distinguishes "已达上限" from "金币不足" in the tap feedback
 }
 
 const CARD_W = 660;
@@ -74,6 +75,7 @@ const ROW_H = 60;
 export class UpgradePanel extends Component {
   private data: UpgradePanelData | null = null;
   private goldLabel: Label | null = null;
+  private toastLabel: Label | null = null;
   private readonly rows = new Map<UpgradeId, RowView>();
 
   /** Build and display the panel for `data`. Call once. */
@@ -98,16 +100,19 @@ export class UpgradePanel extends Component {
     card.stroke();
 
     // Header.
-    this.addLabel(`LEVEL ${data.level} CLEARED`, 0, CARD_H / 2 - 50, 40, new Color(180, 220, 140, 255));
-    this.goldLabel = this.addLabel('Gold: 0', 0, CARD_H / 2 - 100, 28, new Color(255, 210, 63, 255));
+    this.addLabel(`第 ${data.level} 关完成`, 0, CARD_H / 2 - 50, 40, new Color(180, 220, 140, 255));
+    this.goldLabel = this.addLabel('当前金币：0', 0, CARD_H / 2 - 100, 28, new Color(255, 210, 63, 255));
 
     // Upgrade rows (top -> bottom).
     const rowData = data.getRows();
     const firstY = CARD_H / 2 - 160;
     rowData.forEach((r, i) => this.buildRow(r, 0, firstY - i * (ROW_H + 14)));
 
+    // Transient feedback line ("金币不足" / "已达上限"), above the Continue button.
+    this.toastLabel = this.addLabel('', 0, -CARD_H / 2 + 96, 24, new Color(230, 130, 90, 255));
+
     // Continue.
-    this.buildContinueButton(0, -CARD_H / 2 + 50, 260, 64);
+    this.buildContinueButton(0, -CARD_H / 2 + 50, 280, 64);
 
     this.refresh();
   }
@@ -115,15 +120,16 @@ export class UpgradePanel extends Component {
   /** Re-read gold + every row's state and repaint (after a buy). */
   refresh(): void {
     if (!this.data) return;
-    if (this.goldLabel) this.goldLabel.string = `Gold: ${this.data.getGold()}`;
+    if (this.goldLabel) this.goldLabel.string = `当前金币：${this.data.getGold()}`;
 
     for (const r of this.data.getRows()) {
       const view = this.rows.get(r.id);
       if (!view) continue;
       view.info.string = `${r.name}   Lv.${r.level}`;
-      view.cost.string = r.maxed ? 'MAX' : `${r.cost} g`;
+      view.cost.string = r.maxed ? '已达上限' : `升级价格：${r.cost}`;
       const enabled = !r.maxed && r.affordable;
       view.enabled = enabled;
+      view.maxed = r.maxed;
       this.paintButton(view.buttonBg, enabled);
     }
   }
@@ -138,12 +144,12 @@ export class UpgradePanel extends Component {
     plate.fill();
 
     // Left: name + level. Right of center: cost. Far right: Buy button.
-    const info = this.addLabel(`${r.name}   Lv.${r.level}`, -ROW_W / 2 + 150, y, 26, new Color(235, 235, 235, 255));
-    const cost = this.addLabel('—', ROW_W / 2 - 230, y, 26, new Color(255, 210, 63, 255));
+    const info = this.addLabel(`${r.name}   Lv.${r.level}`, -ROW_W / 2 + 130, y, 26, new Color(235, 235, 235, 255));
+    const cost = this.addLabel('—', ROW_W / 2 - 250, y, 24, new Color(255, 210, 63, 255));
 
     const buttonBg = this.buildBuyButton(r.id, ROW_W / 2 - 90, y, 150, ROW_H - 14);
 
-    this.rows.set(r.id, { info, cost, buttonBg, enabled: false });
+    this.rows.set(r.id, { info, cost, buttonBg, enabled: false, maxed: r.maxed });
   }
 
   private buildBuyButton(id: UpgradeId, x: number, y: number, w: number, h: number): Graphics {
@@ -160,7 +166,7 @@ export class UpgradePanel extends Component {
     labelNode.layer = Layers.Enum.UI_2D;
     labelNode.addComponent(UITransform).setAnchorPoint(0.5, 0.5);
     const label = labelNode.addComponent(Label);
-    label.string = 'Buy';
+    label.string = '升级';
     label.fontSize = 26;
     label.lineHeight = 30;
     label.color = new Color(245, 245, 245, 255);
@@ -174,10 +180,25 @@ export class UpgradePanel extends Component {
 
   private handleBuy(id: UpgradeId): void {
     const view = this.rows.get(id);
-    if (!view || !view.enabled || !this.data) return; // ignore taps on disabled rows
+    if (!view || !this.data) return;
+    // Disabled rows still respond — they explain WHY they can't be bought.
+    if (view.maxed) { this.showToast('已达上限'); return; }
+    if (!view.enabled) { this.showToast('金币不足'); return; }
     this.data.onBuy(id);
     this.refresh();
   }
+
+  /** Flash a short feedback message under the rows (auto-clears after ~1.2s). */
+  private showToast(msg: string): void {
+    if (!this.toastLabel) return;
+    this.toastLabel.string = msg;
+    this.unschedule(this.clearToast);
+    this.scheduleOnce(this.clearToast, 1.2);
+  }
+
+  private readonly clearToast = (): void => {
+    if (this.toastLabel) this.toastLabel.string = '';
+  };
 
   private buildContinueButton(x: number, y: number, w: number, h: number): void {
     const node = new Node('ContinueButton');
@@ -198,7 +219,7 @@ export class UpgradePanel extends Component {
     labelNode.layer = Layers.Enum.UI_2D;
     labelNode.addComponent(UITransform).setAnchorPoint(0.5, 0.5);
     const label = labelNode.addComponent(Label);
-    label.string = 'Next Level';
+    label.string = '继续下一波';
     label.fontSize = 30;
     label.lineHeight = 36;
     label.color = new Color(245, 245, 245, 255);

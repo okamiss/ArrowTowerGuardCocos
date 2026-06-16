@@ -1,14 +1,17 @@
 /**
- * ResultPanel.ts
+ * PausePanel.ts
  * ----------------------------------------------------------------------------
- * The end-of-run summary overlay (defeat for the MVP). A deliberately SIMPLE,
- * code-built panel — no .scene authoring — matching how BattleManager builds the
- * rest of the battlefield. It is a pure presenter: it renders the numbers it is
- * handed and fires `onRestart` when the button is tapped. It owns no game state
- * and never touches the save or EventBus directly.
+ * The modal overlay shown when the player taps Pause. A code-built panel (no
+ * .scene authoring) matching the other UI. Pure presenter: it shows three
+ * buttons and fires the matching intent — it owns no game state and never
+ * touches the save, the battle, or the EventBus directly. BattleManager wires
+ * the callbacks and decides what each one does:
+ *   - 继续游戏   -> onResume       (unfreeze the battle, close this panel)
+ *   - 重新开始   -> onRestart      (reload the battle scene)
+ *   - 返回主界面 -> onReturnToMain (switch to MainScene)
  *
- * Usage: BattleManager creates a child node centered under the Canvas, adds this
- * component, and calls `show({ ... })` once the castle falls.
+ * Its full-screen dim + BlockInputEvents swallow taps, so the battlefield and
+ * the HUD pause button underneath cannot be triggered while it is up.
  *
  * Required scene refs: none (the node tree is built in `show()`).
  * ----------------------------------------------------------------------------
@@ -25,41 +28,32 @@ const { ccclass } = _decorator;
 const HALF_W = GameConfig.layout.designWidth / 2;
 const HALF_H = GameConfig.layout.designHeight / 2;
 
-/** Everything the panel displays, plus the button hooks. */
-export interface ResultData {
-  /** Level (关) reached this run. */
-  level: number;
-  /** Monsters killed this run. */
-  kills: number;
-  /** Gold earned this run. */
-  goldEarned: number;
-  /** Best level (关) ever reached (post-save). */
-  highestLevel: number;
-  /** Invoked when the player taps "重新开始". */
+/** The three pause intents. All behavior lives in BattleManager. */
+export interface PausePanelData {
+  onResume: () => void;
   onRestart: () => void;
-  /** Invoked when the player taps "返回主界面". */
   onReturnToMain: () => void;
 }
 
-@ccclass('ResultPanel')
-export class ResultPanel extends Component {
-  private data: ResultData | null = null;
+@ccclass('PausePanel')
+export class PausePanel extends Component {
+  private data: PausePanelData | null = null;
 
   /** Build and display the panel for `data`. Call once. */
-  show(data: ResultData): void {
+  show(data: PausePanelData): void {
     this.data = data;
 
-    // Full-screen dim that also swallows taps from reaching the battlefield.
+    // Full-screen dim that also swallows taps from reaching the battlefield/HUD.
     this.node.addComponent(UITransform).setContentSize(HALF_W * 2, HALF_H * 2);
     this.node.addComponent(BlockInputEvents);
     const dim = this.node.addComponent(Graphics);
-    dim.fillColor = new Color(0, 0, 0, 180);
+    dim.fillColor = new Color(0, 0, 0, 190);
     dim.rect(-HALF_W, -HALF_H, HALF_W * 2, HALF_H * 2);
     dim.fill();
 
     // Central card.
-    const cardW = 560;
-    const cardH = 480;
+    const cardW = 460;
+    const cardH = 420;
     const card = this.addGraphics('Card');
     card.fillColor = new Color(28, 34, 22, 245);
     card.roundRect(-cardW / 2, -cardH / 2, cardW, cardH, 16);
@@ -68,15 +62,15 @@ export class ResultPanel extends Component {
     card.strokeColor = new Color(120, 150, 90, 255);
     card.stroke();
 
-    // Title + stat rows (top -> bottom inside the card).
-    this.addLabel('战斗结束', 0, 190, 48, new Color(220, 90, 80, 255), true);
-    this.addLabel(`到达关卡：第 ${data.level} 关`, 0, 118, 30, new Color(235, 235, 235, 255), true);
-    this.addLabel(`击杀数量：${data.kills}`, 0, 70, 30, new Color(235, 235, 235, 255), true);
-    this.addLabel(`获得金币：${data.goldEarned}`, 0, 22, 30, new Color(255, 210, 63, 255), true);
-    this.addLabel(`最高关卡：第 ${data.highestLevel} 关`, 0, -26, 30, new Color(180, 220, 140, 255), true);
+    this.addLabel('已暂停', 0, cardH / 2 - 64, 44, new Color(255, 210, 63, 255));
 
-    this.buildButton('重新开始', 0, -100, 280, 62, () => this.fire(this.data?.onRestart), true);
-    this.buildButton('返回主界面', 0, -176, 280, 62, () => this.fire(this.data?.onReturnToMain), false);
+    const btnW = 320;
+    const btnH = 70;
+    const step = btnH + 22;
+    const y0 = 70;
+    this.buildButton('继续游戏', 0, y0, btnW, btnH, () => this.fire(this.data?.onResume), true);
+    this.buildButton('重新开始', 0, y0 - step, btnW, btnH, () => this.fire(this.data?.onRestart), false);
+    this.buildButton('返回主界面', 0, y0 - 2 * step, btnW, btnH, () => this.fire(this.data?.onReturnToMain), false);
   }
 
   // --- internals ------------------------------------------------------------
@@ -100,7 +94,7 @@ export class ResultPanel extends Component {
 
     const g = node.addComponent(Graphics);
     g.fillColor = primary ? new Color(74, 110, 58, 255) : new Color(74, 90, 58, 255);
-    g.roundRect(-w / 2, -h / 2, w, h, 10);
+    g.roundRect(-w / 2, -h / 2, w, h, 12);
     g.fill();
     g.lineWidth = 3;
     g.strokeColor = primary ? new Color(150, 200, 110, 255) : new Color(150, 180, 110, 255);
@@ -129,18 +123,19 @@ export class ResultPanel extends Component {
     return node.addComponent(Graphics);
   }
 
-  private addLabel(text: string, x: number, y: number, size: number, col: Color, center: boolean): Label {
+  private addLabel(text: string, x: number, y: number, size: number, col: Color): Label {
     const node = new Node('label');
     node.layer = Layers.Enum.UI_2D;
     const ut = node.addComponent(UITransform);
-    ut.setContentSize(520, size * 1.4);
+    ut.setContentSize(440, size * 1.4);
     ut.setAnchorPoint(0.5, 0.5);
     const label = node.addComponent(Label);
     label.string = text;
     label.fontSize = size;
     label.lineHeight = size * 1.2;
     label.color = col;
-    label.horizontalAlign = center ? Label.HorizontalAlign.CENTER : Label.HorizontalAlign.LEFT;
+    label.horizontalAlign = Label.HorizontalAlign.CENTER;
+    label.verticalAlign = Label.VerticalAlign.CENTER;
     this.node.addChild(node);
     node.setPosition(x, y, 0);
     return label;
