@@ -8,7 +8,7 @@
  */
 
 import { GameConfig } from '../core/GameConfig';
-import type { UpgradeId } from '../core/GameConfig';
+import type { UpgradeId, SkillId } from '../core/GameConfig';
 
 /** Permanent upgrade levels (the 4 MVP upgrades). */
 export interface UpgradeSaveData {
@@ -18,7 +18,11 @@ export interface UpgradeSaveData {
   castleHpLevel: number;
 }
 
-/** Skill levels. Skills are post-MVP; these are reserved and default to 0. */
+/**
+ * Skill levels. The 3 active skills (multishot / iceSpike / fireball) are LIVE
+ * and start at level 1 on a fresh profile (and are backfilled to >=1 for older
+ * saves — see SaveVersionManager). The remaining three are reserved stubs.
+ */
 export interface SkillSaveData {
   multishotLevel: number;
   iceSpikeLevel: number;
@@ -78,6 +82,17 @@ export const UPGRADE_LEVEL_KEY: Record<UpgradeId, keyof UpgradeSaveData> = {
   castleHp: 'castleHpLevel',
 };
 
+/**
+ * Maps the gameplay-facing SkillId to its level field on the save's `skills`
+ * block. Mirrors UPGRADE_LEVEL_KEY so SkillSystem stays id-driven while the
+ * stored shape uses explicit `*Level` fields.
+ */
+export const SKILL_LEVEL_KEY: Record<SkillId, keyof SkillSaveData> = {
+  multishot: 'multishotLevel',
+  iceSpike: 'iceSpikeLevel',
+  fireball: 'fireballLevel',
+};
+
 /** A brand-new profile. */
 export function createDefaultSaveData(): PlayerSaveData {
   const now = Date.now();
@@ -97,9 +112,11 @@ export function createDefaultSaveData(): PlayerSaveData {
       castleHpLevel: 0,
     },
     skills: {
-      multishotLevel: 0,
-      iceSpikeLevel: 0,
-      fireballLevel: 0,
+      // The 3 active skills ship unlocked at level 1 so they are usable on a
+      // brand-new profile. The reserved stubs stay at 0.
+      multishotLevel: 1,
+      iceSpikeLevel: 1,
+      fireballLevel: 1,
       lightningLevel: 0,
       healingLevel: 0,
       coinBoostLevel: 0,

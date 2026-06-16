@@ -43,6 +43,16 @@ export class SaveVersionManager {
       ...data,
       version: 3,
     }),
+    // v3 -> v4: the 3 active skills (multishot / iceSpike / fireball) went live.
+    // Grant existing players level 1 of each so the skills are usable, without
+    // touching any other progress. A missing `skills` block is created fresh.
+    3: (data: any) => {
+      const skills = { ...(data.skills ?? {}) };
+      if (!(skills.multishotLevel > 0)) skills.multishotLevel = 1;
+      if (!(skills.iceSpikeLevel > 0)) skills.iceSpikeLevel = 1;
+      if (!(skills.fireballLevel > 0)) skills.fireballLevel = 1;
+      return { ...data, version: 4, skills };
+    },
   };
 
   static get currentVersion(): number {

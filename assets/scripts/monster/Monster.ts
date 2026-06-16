@@ -58,6 +58,12 @@ export class Monster extends Component {
   private attacking = false;
   private attackTimer = 0;
 
+  // Skill-applied slow (IceSpike). `slowFactor` scales the walk speed (1 = full
+  // speed, <1 = slowed); `slowTimer` counts down, restoring full speed at 0.
+  // The base `_speed` is never mutated, so the original speed always returns.
+  private slowFactor = 1;
+  private slowTimer = 0;
+
   get id(): MonsterId {
     return this.cfg.id;
   }
@@ -110,6 +116,8 @@ export class Monster extends Component {
     this._active = true;
     this.attacking = false;
     this.attackTimer = 0;
+    this.slowFactor = 1;
+    this.slowTimer = 0;
     this.applyArt(frame);
     this.node.setPosition(x, y, 0);
     this.node.active = true;
@@ -125,6 +133,15 @@ export class Monster extends Component {
   step(dt: number, castleX: number): MonsterStep {
     if (!this._active) return MonsterStep.Alive;
 
+    // Tick any active slow; restore full speed once it expires.
+    if (this.slowTimer > 0) {
+      this.slowTimer -= dt;
+      if (this.slowTimer <= 0) {
+        this.slowTimer = 0;
+        this.slowFactor = 1;
+      }
+    }
+
     if (this.attacking) {
       this.attackTimer -= dt;
       if (this.attackTimer <= 0) {
@@ -135,7 +152,7 @@ export class Monster extends Component {
     }
 
     const p = this.node.position;
-    const nx = p.x - this._speed * dt;
+    const nx = p.x - this._speed * this.slowFactor * dt;
     if (nx <= castleX) {
       // Snap to the castle line, latch into the attacking state, and let the
       // first bite land on the very next step (attackTimer starts at 0).
@@ -155,6 +172,18 @@ export class Monster extends Component {
     return this.hp <= 0;
   }
 
+  /**
+   * Apply (or refresh) a temporary slow. `rate` is the fraction of speed removed
+   * (0..1, e.g. 0.5 => 50% slower); `duration` is how long it lasts in seconds.
+   * First-pass behavior: a fresh slow REPLACES the current one and refreshes the
+   * timer (no stacking). The base speed is never mutated, so it always recovers.
+   */
+  applySlow(rate: number, duration: number): void {
+    if (!this._active) return;
+    this.slowFactor = Math.max(0, 1 - rate);
+    this.slowTimer = duration;
+  }
+
   /** Reset to an idle pooled state (called by MonsterSpawner on recycle). */
   deactivate(): void {
     this._active = false;
@@ -164,6 +193,8 @@ export class Monster extends Component {
     this._speed = 0;
     this.attacking = false;
     this.attackTimer = 0;
+    this.slowFactor = 1;
+    this.slowTimer = 0;
     this.node.active = false;
   }
 

@@ -70,6 +70,9 @@ export class BattleUI extends Component {
   private castleLabel: Label | null = null;
   private castleBar: Graphics | null = null;
 
+  // Pause-button rect in this.node-local space, for fire-suppression hit-tests.
+  private pauseRect: { cx: number; cy: number; w: number; h: number } | null = null;
+
   /** Build the HUD node tree and paint the initial state. Call once. */
   build(data: BattleUiData): void {
     this.data = data;
@@ -93,6 +96,7 @@ export class BattleUI extends Component {
     const pauseCx = HALF_W - MARGIN - pauseW / 2;
     const pauseCy = HALF_H - MARGIN - pauseH / 2;
     this.buildPauseButton(pauseCx, pauseCy, pauseW, pauseH);
+    this.pauseRect = { cx: pauseCx, cy: pauseCy, w: pauseW, h: pauseH };
     this.goldLabel = this.addLabel('金币：0', pauseCx - pauseW / 2 - 24, pauseCy, 28, gold, 1);
 
     // bottom-left: kills
@@ -143,6 +147,13 @@ export class BattleUI extends Component {
     const max = maxHp ?? this.data.getCastleMaxHp();
     if (this.castleLabel) this.castleLabel.string = `城墙 ${cur} / ${max}`;
     this.paintCastleBar(cur, max);
+  }
+
+  /** True if the battle-local point (this.node space) lands on the pause button.
+   *  BattleManager uses this to stop a tap on pause from also firing an arrow. */
+  hitTestLocal(x: number, y: number): boolean {
+    const r = this.pauseRect;
+    return !!r && Math.abs(x - r.cx) <= r.w / 2 && Math.abs(y - r.cy) <= r.h / 2;
   }
 
   // --- internals ------------------------------------------------------------

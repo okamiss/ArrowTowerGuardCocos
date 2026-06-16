@@ -23,6 +23,8 @@
  */
 export type MonsterId = 'goblin' | 'bat' | 'brute' | 'overlord';
 export type UpgradeId = 'damage' | 'attackSpeed' | 'crit' | 'castleHp';
+/** The active battle skills shipped in the first SkillSystem pass. */
+export type SkillId = 'multishot' | 'iceSpike' | 'fireball';
 export type Lane = 'ground' | 'air';
 
 export interface MonsterConfig {
@@ -114,6 +116,24 @@ export interface LevelPlan {
   readonly totalCount: number;             // monsters across all waves (diagnostics)
 }
 
+/**
+ * One active-skill definition. Fields are shared across all skills; per-skill
+ * only the relevant ones are set (e.g. multishot has no `radius`, fireball has
+ * no `slow*`). SkillSystem reads the fields its skill actually uses.
+ */
+export interface SkillConfig {
+  readonly name: string;          // display name on the skill button
+  readonly cooldown: number;      // seconds between casts
+  readonly arrowCount?: number;   // multishot: arrows per cast
+  readonly interval?: number;     // multishot: seconds between rapid arrows
+  readonly damage?: number;       // iceSpike/fireball: area damage
+  readonly radius?: number;       // iceSpike/fireball: area-of-effect radius (px)
+  readonly slowRate?: number;     // iceSpike: fraction of speed removed (0..1)
+  readonly slowDuration?: number; // iceSpike: seconds the slow lasts
+  readonly color?: string;        // placeholder-effect tint (hex)
+  readonly effectDuration?: number; // seconds the placeholder visual lingers
+}
+
 export interface UpgradeConfig {
   readonly id: UpgradeId;
   readonly name: string;
@@ -182,6 +202,40 @@ export const GameConfig = {
      *  The per-hit damage is each monster's `castleDamage` (see `monsters`). */
     castleAttackInterval: 1.0,
   },
+
+  /**
+   * Active battle skills (first SkillSystem pass). The PER-PLAYER skill LEVEL is
+   * stored in PlayerSaveData.skills; every tunable below (cooldown / damage /
+   * radius / slow / cadence) is read live by SkillSystem so no skill code
+   * hard-codes balance numbers. `name` is the display string shown on the skill
+   * button. Placeholder-effect tints/durations drive the simple FX nodes only.
+   */
+  skills: {
+    multishot: {
+      name: '多重箭',
+      cooldown: 8,     // seconds between casts
+      arrowCount: 3,   // arrows fired per cast
+      interval: 0.12,  // seconds between the rapid-fire arrows
+    },
+    iceSpike: {
+      name: '冰刺',
+      cooldown: 10,
+      damage: 30,          // one-time area damage
+      radius: 120,         // px area-of-effect radius
+      slowRate: 0.5,       // fraction of speed removed (0.5 => 50% slower)
+      slowDuration: 2,     // seconds the slow lasts before speed recovers
+      color: '#5ab0e8',    // placeholder FX tint (icy blue)
+      effectDuration: 0.5, // seconds the placeholder visual lingers
+    },
+    fireball: {
+      name: '火球',
+      cooldown: 6,
+      damage: 50,          // one-time explosion damage
+      radius: 140,         // px area-of-effect radius
+      color: '#ff8a3a',    // placeholder FX tint (orange)
+      effectDuration: 0.4,
+    },
+  } as Record<SkillId, SkillConfig>,
 
   /** Object-pool prewarm sizes (perf infra, not balance). */
   pool: {
@@ -326,7 +380,7 @@ export const GameConfig = {
   /** Save layer. */
   save: {
     storageKey: 'arrowtowerguard.save',
-    version: 3,
+    version: 4,
     /** Default persistence backend; SaveServiceFactory reads this. */
     backend: 'local' as 'local' | 'cloud',
     /** Coalesce window (s): gold-earning kills are flushed to storage at most

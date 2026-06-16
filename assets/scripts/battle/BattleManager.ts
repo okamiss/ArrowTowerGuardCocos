@@ -22,10 +22,10 @@
 
 import {
   _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Vec3,
-  input, Input, EventTouch, EventMouse, director,
+  input, Input, EventTouch, EventMouse, director, Graphics, Color, UIOpacity, tween,
 } from 'cc';
 import { GameConfig, getWavesPerLevel } from '../core/GameConfig';
-import type { MonsterId, UpgradeId } from '../core/GameConfig';
+import type { MonsterId, UpgradeId, SkillId } from '../core/GameConfig';
 import { eventBus, GameEvent } from '../core/EventBus';
 import { Wallet } from '../economy/Wallet';
 import { UpgradeSystem } from '../upgrades/UpgradeSystem';
@@ -41,12 +41,15 @@ import type { Arrow } from '../projectile/Arrow';
 import { MonsterSpawner } from './MonsterSpawner';
 import { Monster, MonsterStep } from '../monster/Monster';
 import { DamageSystem } from './DamageSystem';
+import { SkillSystem, SKILL_IDS } from './SkillSystem';
+import type { SkillContext } from './SkillSystem';
 import { Castle } from './Castle';
 import { ArcherController } from '../player/ArcherController';
 import { ResultPanel } from '../ui/ResultPanel';
 import { UpgradePanel } from '../ui/UpgradePanel';
 import type { UpgradeRowData } from '../ui/UpgradePanel';
 import { BattleUI } from '../ui/BattleUI';
+import { SkillBar } from '../ui/SkillBar';
 import { PausePanel } from '../ui/PausePanel';
 import { DamageTextPool } from '../ui/DamageText';
 import { GoldPopupTextPool } from '../ui/GoldPopupText';
@@ -57,6 +60,11 @@ const { ccclass } = _decorator;
 
 const HALF_W = GameConfig.layout.designWidth / 2;
 const HALF_H = GameConfig.layout.designHeight / 2;
+
+// Bottom band (px from the screen bottom) occupied by the skill bar. A drag is
+// only treated as "placing in the battlefield" once it rises above this band, so
+// jitter during a plain button tap never relocates the skill's impact point.
+const SKILL_BAR_BAND = 110;
 
 // Scratch vector for touch -> local-point conversion (avoid per-tap alloc).
 const _tap = new Vec3();
@@ -76,15 +84,30 @@ export class BattleManager extends Component {
   private damageSystem!: DamageSystem;
   private castle!: Castle;
   private archer!: ArcherController;
+  private skillSystem!: SkillSystem;
   private levelManager!: LevelManager;
 
   // --- art ---
   private readonly frames = new Map<string, SpriteFrame | null>();
   private ui!: UITransform; // this.node's transform; tap conversion uses it
+  private fxLayer!: Node;    // parent for pooled floating text AND skill FX circles
 
   // --- floating combat FX (pooled; built over the battlefield) ---
   private damageTexts!: DamageTextPool;
   private goldPopups!: GoldPopupTextPool;
+
+  // --- skills ---
+  private skillBar: SkillBar | null = null;
+  private readonly skillMuzzle = new Vec3();    // arrow launch origin for multishot
+  private readonly skillArrowTarget = new Vec3(); // scratch target for skill arrows
+
+  // Drag-to-aim: while `aimingSkill` is set the player is choosing an impact point
+  // for that skill. `skillAimPoint` is the chosen point (battle-local); the preview
+  // node visualizes it. Set on button press, moved by the drag, consumed on release.
+  private aimingSkill: SkillId | null = null;
+  private readonly skillAimPoint = new Vec3();
+  private aimPreview: Graphics | null = null;
+  private readonly _localPt = new Vec3(); // scratch for screen->battle-local conversion
 
   // --- active entities (the per-frame battle path) ---
   private readonly arrows: Arrow[] = [];
@@ -146,6 +169,7 @@ export class BattleManager extends Component {
     // --- preload real art, then build the scene ---
     await this.preloadArt();
     const { monsterLayer, arrowLayer, fxLayer } = this.buildField();
+    this.fxLayer = fxLayer;
     this.damageTexts = new DamageTextPool(fxLayer);
     this.goldPopups = new GoldPopupTextPool(fxLayer);
     this.buildBattleUi();
@@ -163,6 +187,13 @@ export class BattleManager extends Component {
       GameConfig.layout.towerMuzzle.x - HALF_W,
       GameConfig.layout.towerMuzzle.y - HALF_H,
     );
+
+    // Skills: same launch origin as the archer; SkillSystem owns cooldowns/cast
+    // logic and reaches the battle through the context below (no skill logic in
+    // the UI). Levels come from the loaded profile (the 3 MVP skills start at 1).
+    this.skillMuzzle.set(GameConfig.layout.towerMuzzle.x - HALF_W, GameConfig.layout.towerMuzzle.y - HALF_H, 0);
+    this.skillSystem = new SkillSystem(this.profile, this.makeSkillContext());
+    this.buildSkillBar();
 
     // Hold-to-fire. Touch covers mobile; mouse covers desktop/editor preview.
     // Press starts firing + sets aim; move updates aim; release stops.
@@ -201,7 +232,8 @@ export class BattleManager extends Component {
     if (!this.booted || this.over || this.paused) return;
 
     this.archer.tick(dt);
-    if (this.firing) this.fireAtAim(); // continuous fire, gated by cooldown
+    if (this.firing && !this.aimingSkill) this.fireAtAim(); // continuous fire, gated by cooldown
+    this.skillSystem.update(dt);       // tick skill cooldowns + drain multishot bursts
 
     // Time-scheduled waves: any wave whose startTime elapsed this tick begins
     // spawning now — it does NOT wait for earlier waves to be cleared.
@@ -279,6 +311,8 @@ export class BattleManager extends Component {
     this.over = true;
     this.paused = false;
     this.firing = false;
+    this.aimingSkill = null;
+    this.hideAimPreview();
     this.spawner.stop();
 
     const level = this.levelManager.currentLevel;
@@ -339,6 +373,8 @@ export class BattleManager extends Component {
     if (this.over || this.paused) return;
     this.paused = true;
     this.firing = false;
+    this.aimingSkill = null;
+    this.hideAimPreview();
     this.spawner.stop();
 
     const clearedLevel = this.levelManager.currentLevel;
@@ -479,6 +515,8 @@ export class BattleManager extends Component {
     if (!this.booted || this.over || this.paused) return;
     this.paused = true;
     this.firing = false;
+    this.aimingSkill = null;
+    this.hideAimPreview();
     eventBus.emit(GameEvent.GamePaused, {});
 
     const node = new Node('PausePanel');
@@ -579,9 +617,12 @@ export class BattleManager extends Component {
 
   // --- input ----------------------------------------------------------------
 
-  /** Press: start firing and aim at the press point. */
+  /** Press: start firing and aim at the press point — UNLESS the press landed on
+   *  a UI button (skill bar or pause). A tap on UI must never also fire an arrow;
+   *  skill buttons additionally drive their own drag-to-aim gesture. */
   private onPointerDown(e: EventTouch | EventMouse): void {
     if (!this.booted || this.over || this.paused) return;
+    if (this.isOverUI(e)) return;
     this.firing = true;
     this.updateAim(e);
   }
@@ -602,6 +643,22 @@ export class BattleManager extends Component {
     const ui = e.getUILocation(); // UI/world space (design px, bottom-left origin)
     _tap.set(ui.x, ui.y, 0);
     this.ui.convertToNodeSpaceAR(_tap, this.aimTarget); // -> center-origin local space
+  }
+
+  /** Convert a touch/mouse event to battle-local (center-origin) space.
+   *  Returns a shared scratch Vec3 — copy out if you need to retain it. */
+  private toBattleLocal(e: EventTouch | EventMouse): Vec3 {
+    const ui = e.getUILocation();
+    _tap.set(ui.x, ui.y, 0);
+    return this.ui.convertToNodeSpaceAR(_tap, this._localPt);
+  }
+
+  /** True if the press lands on an interactive HUD element (skill button or
+   *  pause). Hit-tested in battle-local space so it is independent of which input
+   *  listener (global vs node) fires first. */
+  private isOverUI(e: EventTouch | EventMouse): boolean {
+    const p = this.toBattleLocal(e);
+    return !!this.skillBar?.hitTestLocal(p.x, p.y) || !!this.battleUI?.hitTestLocal(p.x, p.y);
   }
 
   /** One firing attempt per frame; the archer's cooldown sets the real rate. */
@@ -759,6 +816,196 @@ export class BattleManager extends Component {
       getAliveMonsters: () => this.getAliveMonsterCount(),
       onPause: () => this.pauseGame(),
     });
+  }
+
+  // --- skills ---------------------------------------------------------------
+
+  /** Build the bottom skill-button row. The bar is display-only: it reads cooldown
+   *  state via the SkillSystem getters and forwards the raw press/drag/release
+   *  gesture to the drag-to-aim handlers (no skill logic lives in the bar). */
+  private buildSkillBar(): void {
+    const node = new Node('SkillBar');
+    node.layer = Layers.Enum.UI_2D;
+    this.node.addChild(node);
+    this.skillBar = node.addComponent(SkillBar);
+    this.skillBar.build({
+      items: SKILL_IDS.map((id) => ({ id, name: GameConfig.skills[id].name })),
+      getLevel: (id) => this.skillSystem.getLevel(id),
+      getCooldownRemaining: (id) => this.skillSystem.getCooldownRemaining(id),
+      // Disable while paused / over so the buttons grey out with the rest of play.
+      canCast: (id) => this.booted && !this.over && !this.paused && this.skillSystem.canCast(id),
+      onAimStart: (id, e) => this.onSkillAimStart(id, e),
+      onAimMove: (id, e) => this.onSkillAimMove(id, e),
+      onAimEnd: (id, e) => this.onSkillAimEnd(id, e),
+    });
+  }
+
+  // --- drag-to-aim ----------------------------------------------------------
+
+  /** Press on a (castable) skill button: arm aiming. The impact point starts at
+   *  the auto-target (lead cluster), so a plain tap-release still casts there;
+   *  dragging into the field relocates it. Shows the preview indicator. */
+  private onSkillAimStart(id: SkillId, _e: EventTouch): void {
+    if (!this.booted || this.over || this.paused) return;
+    if (!this.skillSystem.canCast(id)) return;
+    this.aimingSkill = id;
+    const auto = this.skillSystem.getAutoTarget(id);
+    this.skillAimPoint.set(auto.x, auto.y, 0);
+    this.updateAimPreview(id);
+  }
+
+  /** Drag while aiming: follow the finger, but only once it is up in the
+   *  battlefield (ignore jitter still over the skill bar so a tap stays a tap). */
+  private onSkillAimMove(id: SkillId, e: EventTouch): void {
+    if (this.aimingSkill !== id) return;
+    const p = this.toBattleLocal(e);
+    if (p.y <= SKILL_BAR_BAND - HALF_H) return; // still over the bar band; ignore
+    this.skillAimPoint.set(p.x, p.y, 0);
+    this.updateAimPreview(id);
+  }
+
+  /** Release while aiming: cast at the chosen point, then clear the preview. */
+  private onSkillAimEnd(id: SkillId, _e: EventTouch): void {
+    if (this.aimingSkill !== id) return;
+    this.aimingSkill = null;
+    this.hideAimPreview();
+    if (!this.booted || this.over || this.paused) return;
+    this.skillSystem.castSkill(id, { x: this.skillAimPoint.x, y: this.skillAimPoint.y });
+  }
+
+  /** Draw/refresh the aim indicator: an AoE circle (ice/fire) or a small reticle
+   *  (multishot) at the current impact point, tinted with the skill's color. */
+  private updateAimPreview(id: SkillId): void {
+    if (!this.aimPreview) {
+      const pv = new Node('AimPreview');
+      pv.layer = Layers.Enum.UI_2D;
+      pv.addComponent(UITransform);
+      this.fxLayer.addChild(pv);
+      this.aimPreview = pv.addComponent(Graphics);
+    }
+    const g = this.aimPreview;
+    g.node.active = true;
+    g.node.setPosition(this.skillAimPoint.x, this.skillAimPoint.y, 0);
+
+    const radius = this.skillSystem.getAreaRadius(id) || 36; // reticle size for point skills
+    const fill = new Color();
+    fill.fromHEX(this.skillSystem.getColor(id));
+    fill.a = 70;
+    const stroke = new Color();
+    stroke.fromHEX(this.skillSystem.getColor(id));
+    stroke.a = 235;
+
+    g.clear();
+    g.fillColor = fill;
+    g.circle(0, 0, radius);
+    g.fill();
+    g.lineWidth = 3;
+    g.strokeColor = stroke;
+    g.circle(0, 0, radius);
+    g.stroke();
+  }
+
+  /** Hide (but keep) the reusable aim-preview node. */
+  private hideAimPreview(): void {
+    if (this.aimPreview) {
+      this.aimPreview.clear();
+      this.aimPreview.node.active = false;
+    }
+  }
+
+  /** The battle-side hooks SkillSystem drives. Skills decide WHAT/WHERE; this
+   *  object owns HOW (pools, monster list, damage, FX) — keeping skill logic out
+   *  of both the UI and the SkillSystem's pure core. */
+  private makeSkillContext(): SkillContext {
+    return {
+      getMonsters: () => this.monsters,
+      getPlayerArrowDamage: () => this.stats.damage,
+      fireArrowAt: (tx, ty, dmg) => this.fireSkillArrow(tx, ty, dmg),
+      dealAreaDamage: (cx, cy, r, dmg) => this.applyAreaDamage(cx, cy, r, dmg),
+      applyAreaSlow: (cx, cy, r, rate, dur) => this.applyAreaSlowInArea(cx, cy, r, rate, dur),
+      spawnSkillEffect: (cx, cy, r, color, dur) => this.spawnSkillEffect(cx, cy, r, color, dur),
+    };
+  }
+
+  /** Launch one skill arrow from the tower toward (tx, ty), bypassing the archer
+   *  cooldown. Reuses the same ArrowPool + active-arrow list as normal fire, so it
+   *  collides and recycles identically. */
+  private fireSkillArrow(tx: number, ty: number, damage: number): void {
+    if (this.over || this.paused) return;
+    const arrow = this.arrowPool.get();
+    this.skillArrowTarget.set(tx, ty, 0);
+    arrow.launch(this.skillMuzzle, this.skillArrowTarget, damage);
+    this.arrows.push(arrow);
+  }
+
+  /** Apply one-shot area damage to every live monster within `radius` of the
+   *  center. Mirrors the arrow-hit path (crit roll, damage text, gold + recycle on
+   *  kill) so AoE kills count toward gold / level completion exactly like arrows. */
+  private applyAreaDamage(cx: number, cy: number, radius: number, damage: number): void {
+    if (damage <= 0) return;
+    for (let j = this.monsters.length - 1; j >= 0; j--) {
+      const m = this.monsters[j];
+      const reach = radius + m.radius;
+      const dx = m.positionX - cx;
+      const dy = m.positionY - cy;
+      if (dx * dx + dy * dy > reach * reach) continue;
+
+      const hitX = m.positionX;
+      const hitY = m.positionY + m.radius;
+      const reward = m.gold;
+      const result = this.damageSystem.applyHit(m, damage);
+      this.damageTexts.show(hitX, hitY, result.dealt, result.crit);
+      if (result.killed) {
+        this.goldPopups.show(hitX, hitY + 24, reward);
+        this.removeMonster(j);
+      }
+    }
+  }
+
+  /** Slow every live monster within `radius` of the center (IceSpike). The slow is
+   *  temporary and self-restoring (Monster.applySlow), never a permanent edit. */
+  private applyAreaSlowInArea(cx: number, cy: number, radius: number, rate: number, duration: number): void {
+    for (const m of this.monsters) {
+      const reach = radius + m.radius;
+      const dx = m.positionX - cx;
+      const dy = m.positionY - cy;
+      if (dx * dx + dy * dy <= reach * reach) m.applySlow(rate, duration);
+    }
+  }
+
+  /** Spawn a simple placeholder FX circle (filled + ring) that pops and fades out
+   *  over `durationSec`, then self-destroys. No art assets required. */
+  private spawnSkillEffect(cx: number, cy: number, radius: number, colorHex: string, durationSec: number): void {
+    const node = new Node('SkillFx');
+    node.layer = Layers.Enum.UI_2D;
+    node.addComponent(UITransform);
+    this.fxLayer.addChild(node);
+    node.setPosition(cx, cy, 0);
+
+    const fill = new Color();
+    fill.fromHEX(colorHex);
+    fill.a = 140;
+    const stroke = new Color();
+    stroke.fromHEX(colorHex);
+    stroke.a = 235;
+
+    const g = node.addComponent(Graphics);
+    g.fillColor = fill;
+    g.circle(0, 0, radius);
+    g.fill();
+    g.lineWidth = 4;
+    g.strokeColor = stroke;
+    g.circle(0, 0, radius);
+    g.stroke();
+
+    node.setScale(0.7, 0.7, 1);
+    tween(node).to(durationSec, { scale: new Vec3(1.15, 1.15, 1) }).start();
+
+    const op = node.addComponent(UIOpacity);
+    tween(op)
+      .to(durationSec, { opacity: 0 })
+      .call(() => node.destroy())
+      .start();
   }
 
   private addLayer(name: string): Node {
