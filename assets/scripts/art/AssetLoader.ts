@@ -64,6 +64,15 @@ class AssetLoaderClass {
     });
   }
 
+  /**
+   * Public preloader: resolve an asset's SpriteFrame up front (or null if the
+   * PNG is absent). Callers that build Sprite nodes directly (e.g. pooled arrows
+   * and monsters) use this instead of the placeholder-swap `applyTo`.
+   */
+  loadSpriteFrame(asset: SpriteAsset): Promise<SpriteFrame | null> {
+    return this.loadFrame(asset);
+  }
+
   /** Load (and cache) the SpriteFrame for an asset, or null if absent. */
   private loadFrame(asset: SpriteAsset): Promise<SpriteFrame | null> {
     const cached = this.cache.get(asset.path);

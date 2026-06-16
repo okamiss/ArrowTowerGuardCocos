@@ -80,6 +80,16 @@ export const GameConfig = {
     speed: 900,      // px/s, straight line toward the tapped point
     lifetime: 2.0,   // seconds before an un-hit arrow is recycled
     pierce: false,   // MVP: single-target
+    radius: 8,       // collision radius (px) of the arrow tip vs monster center
+    cullMargin: 60,  // px beyond the screen edge before an un-hit arrow is recycled
+    spriteWidth: 44, // on-screen arrow sprite size (px); art points right at angle 0
+    spriteHeight: 16,
+  },
+
+  /** Object-pool prewarm sizes (perf infra, not balance). */
+  pool: {
+    arrowPrewarm: 16,
+    monsterPrewarm: 12,
   },
 
   /** Monster definitions, keyed by id. */
@@ -139,6 +149,9 @@ export const GameConfig = {
     version: 1,
     /** Default persistence backend; SaveServiceFactory reads this. */
     backend: 'local' as 'local' | 'cloud',
+    /** Coalesce window (s): gold-earning kills are flushed to storage at most
+     *  this often, never on every per-frame tick. */
+    debounceSec: 1.0,
   },
 
   /** Misc placeholder-art colors. SINGLE SOURCE OF TRUTH for fallback tints —
