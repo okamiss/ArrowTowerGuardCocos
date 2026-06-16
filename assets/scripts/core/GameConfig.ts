@@ -86,6 +86,13 @@ export const GameConfig = {
     spriteHeight: 16,
   },
 
+  /** Melee combat once a monster reaches the castle. */
+  combat: {
+    /** Seconds between successive hits from a monster stopped at the castle.
+     *  The per-hit damage is each monster's `castleDamage` (see `monsters`). */
+    castleAttackInterval: 1.0,
+  },
+
   /** Object-pool prewarm sizes (perf infra, not balance). */
   pool: {
     arrowPrewarm: 16,

@@ -24,6 +24,7 @@ import type { MonsterId } from '../core/GameConfig';
 interface SpawnTicket {
   readonly id: MonsterId;
   readonly interval: number; // seconds to wait before the NEXT spawn
+  readonly wave: number;     // 1-based wave this monster belongs to
 }
 
 /** Resolves the preloaded SpriteFrame for a monster type. */
@@ -34,6 +35,12 @@ export class MonsterSpawner {
   private readonly queue: SpawnTicket[];
   private cursor = 0;
   private timer = 0;
+  private _currentWave = GameConfig.waves.length > 0 ? GameConfig.waves[0].index : 1;
+
+  /** 1-based index of the wave the most recently spawned monster belongs to. */
+  get currentWave(): number {
+    return this._currentWave;
+  }
 
   // Design-space (bottom-left origin) -> center-origin offsets.
   private static readonly HALF_W = GameConfig.layout.designWidth / 2;
@@ -63,6 +70,7 @@ export class MonsterSpawner {
 
     const ticket = this.queue[this.cursor];
     this.timer = ticket.interval;
+    this._currentWave = ticket.wave;
     this.cursor = (this.cursor + 1) % this.queue.length; // endless loop
     onSpawn(this.spawnOne(ticket.id));
   }
@@ -89,7 +97,7 @@ export class MonsterSpawner {
     for (const wave of GameConfig.waves) {
       for (const spawn of wave.spawns) {
         for (let i = 0; i < spawn.count; i++) {
-          q.push({ id: spawn.monster, interval: wave.spawnInterval });
+          q.push({ id: spawn.monster, interval: wave.spawnInterval, wave: wave.index });
         }
       }
     }

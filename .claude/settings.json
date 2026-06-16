@@ -4,7 +4,12 @@
       "Bash(npx --no-install tsc --noEmit -p tsconfig.json)",
       "Bash(ls tsconfig*.json package.json)",
       "Bash(npx -y typescript@latest --version)",
-      "Bash(npx -y -p typescript@5.4.5 tsc -p tsconfig.json --noEmit)"
+      "Bash(npx -y -p typescript@5.4.5 tsc -p tsconfig.json --noEmit)",
+      "Bash(npx --yes typescript@5.4 tsc -p tsconfig.json --noEmit)",
+      "Bash(npm i *)",
+      "Bash(tsc --version)",
+      "Bash(tsc -p tsconfig.json --noEmit)",
+      "Bash(echo \"=== count: $\\(tsc -p tsconfig.json --noEmit 2>&1)"
     ]
   }
 }

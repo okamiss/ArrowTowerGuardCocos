@@ -22,7 +22,7 @@
 
 import {
   _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Color, Vec3, Label,
-  input, Input, EventTouch, EventMouse,
+  input, Input, EventTouch, EventMouse, director,
 } from 'cc';
 import { GameConfig, TOTAL_WAVES } from '../core/GameConfig';
 import type { MonsterId } from '../core/GameConfig';
@@ -42,7 +42,9 @@ import type { Arrow } from '../projectile/Arrow';
 import { MonsterSpawner } from './MonsterSpawner';
 import { Monster, MonsterStep } from '../monster/Monster';
 import { DamageSystem } from './DamageSystem';
+import { Castle } from './Castle';
 import { ArcherController } from '../player/ArcherController';
+import { ResultPanel } from '../ui/ResultPanel';
 
 const { ccclass } = _decorator;
 
@@ -65,6 +67,7 @@ export class BattleManager extends Component {
   private arrowPool!: ArrowPool;
   private spawner!: MonsterSpawner;
   private damageSystem!: DamageSystem;
+  private castle!: Castle;
   private archer!: ArcherController;
 
   // --- art ---
@@ -80,7 +83,13 @@ export class BattleManager extends Component {
   private saveTimer = 0;
 
   private booted = false;
+  private over = false; // latched on defeat: stops spawning, movement, and firing
   private goldLabel: Label | null = null;
+  private castleHpLabel: Label | null = null;
+
+  // Per-run tallies shown on the result screen (reset every battle).
+  private runKills = 0;
+  private runGoldEarned = 0;
 
   // Hold-to-fire: while `firing`, update() launches arrows toward `aimTarget`
   // (gated by the archer's cooldown). `aimTarget` follows the pointer.
@@ -110,6 +119,7 @@ export class BattleManager extends Component {
 
     eventBus.on(GameEvent.GoldChanged, this.onGoldChanged, this);
     eventBus.on(GameEvent.MonsterKilled, this.onMonsterKilled, this);
+    eventBus.on(GameEvent.CastleHpChanged, this.onCastleHpChanged, this);
 
     // --- preload real art, then build the scene ---
     await this.preloadArt();
@@ -120,6 +130,9 @@ export class BattleManager extends Component {
     this.arrowPool = new ArrowPool(arrowLayer, this.frameOf(AssetConfig.tower.arrow));
     this.spawner = new MonsterSpawner(monsterLayer, (id: MonsterId) => this.frameOf(enemyAsset(id)));
     this.damageSystem = new DamageSystem(this.wallet, () => this.stats.critChance);
+    // Castle starts at full upgrade-driven HP; the constructor emits CastleHpChanged
+    // which seeds the HUD bar built above.
+    this.castle = new Castle(this.stats.castleMaxHp);
     this.archer = new ArcherController(
       this.arrowPool,
       () => ({ damage: this.stats.damage, fireCooldown: this.stats.fireCooldown }),
@@ -155,7 +168,7 @@ export class BattleManager extends Component {
   }
 
   protected update(dt: number): void {
-    if (!this.booted) return;
+    if (!this.booted || this.over) return; // defeat freezes spawning/movement/firing
 
     this.archer.tick(dt);
     if (this.firing) this.fireAtAim(); // continuous fire, gated by cooldown
@@ -170,12 +183,60 @@ export class BattleManager extends Component {
   private stepMonsters(dt: number): void {
     for (let i = this.monsters.length - 1; i >= 0; i--) {
       const m = this.monsters[i];
-      if (m.step(dt, this.castleX) === MonsterStep.ReachedCastle) {
-        // MVP demo: monsters reaching the castle line are simply removed.
-        // Castle HP damage is a separate system (Castle/BattleUI), added later.
-        this.removeMonster(i);
+      // A monster that reached the castle stops and bites on a timer. It keeps
+      // living (and stays a valid arrow target) until killed, so it is NOT
+      // recycled here — only its bite damages the castle.
+      if (m.step(dt, this.castleX) === MonsterStep.AttackCastle) {
+        const destroyed = this.castle.takeDamage(m.castleDamage);
+        if (destroyed) {
+          this.onDefeat();
+          return; // stop stepping; the run is over this frame
+        }
       }
     }
+  }
+
+  /**
+   * Castle HP hit 0. Latch the over flag (freezes the next update), persist the
+   * run's outcome (highest wave + lifetime totals), announce GameOver, and pop
+   * the result summary.
+   */
+  private onDefeat(): void {
+    if (this.over) return;
+    this.over = true;
+    this.firing = false;
+
+    const wave = this.spawner.currentWave;
+    this.profile.stats.totalGames += 1;
+    if (wave > this.profile.highestWave) this.profile.highestWave = wave;
+    this.profile.currentWave = wave;
+    this.flushSave('defeat'); // immediate, not coalesced: the run just ended
+
+    eventBus.emit(GameEvent.GameOver, { result: 'lose' });
+    console.log(`[BattleManager] DEFEAT wave=${wave} kills=${this.runKills} gold=${this.runGoldEarned}`);
+
+    this.showResultPanel(wave);
+  }
+
+  /** Build and display the (simple) end-of-run summary overlay. */
+  private showResultPanel(wave: number): void {
+    const node = new Node('ResultPanel');
+    node.layer = Layers.Enum.UI_2D;
+    this.node.addChild(node);
+    const panel = node.addComponent(ResultPanel);
+    panel.show({
+      wave,
+      kills: this.runKills,
+      goldEarned: this.runGoldEarned,
+      highestWave: this.profile.highestWave,
+      onRestart: () => this.restart(),
+    });
+  }
+
+  /** Reload the scene for a fresh run (re-runs GameSceneController -> BattleManager). */
+  private restart(): void {
+    const scene = director.getScene();
+    if (scene) director.loadScene(scene.name);
   }
 
   private stepArrowsAndCollide(dt: number): void {
@@ -229,7 +290,7 @@ export class BattleManager extends Component {
 
   /** Press: start firing and aim at the press point. */
   private onPointerDown(e: EventTouch | EventMouse): void {
-    if (!this.booted) return;
+    if (!this.booted || this.over) return;
     this.firing = true;
     this.updateAim(e);
   }
@@ -271,10 +332,16 @@ export class BattleManager extends Component {
   }
 
   private onMonsterKilled(p: { id: MonsterId; gold: number }): void {
+    this.runKills += 1;
+    this.runGoldEarned += p.gold;
     this.profile.stats.totalKills += 1;
     this.profile.stats.totalGoldEarned += p.gold;
     this.saveDirty = true; // coalesced flush; never write per tick
     console.log(`[BattleManager] killMonster id=${p.id} +${p.gold} gold (total gold=${this.wallet.getGold()})`);
+  }
+
+  private onCastleHpChanged(p: { hp: number; maxHp: number }): void {
+    if (this.castleHpLabel) this.castleHpLabel.string = `Castle: ${p.hp} / ${p.maxHp}`;
   }
 
   private tickSave(dt: number): void {
@@ -356,8 +423,9 @@ export class BattleManager extends Component {
 
   private buildHud(): void {
     this.goldLabel = this.addLabel('Gold: 0', -HALF_W + 20, HALF_H - 30, 26, hexToColor(GameConfig.colors.damageCrit));
-    this.addLabel(`WAVE 1 / ${TOTAL_WAVES}`, -HALF_W + 20, HALF_H - 66, 20, new Color(230, 230, 230));
-    this.addLabel('Tap the field to fire', -HALF_W + 20, HALF_H - 98, 18, new Color(200, 200, 200));
+    this.castleHpLabel = this.addLabel('Castle: -- / --', -HALF_W + 20, HALF_H - 64, 24, new Color(120, 220, 120));
+    this.addLabel(`WAVE 1 / ${TOTAL_WAVES}`, -HALF_W + 20, HALF_H - 96, 20, new Color(230, 230, 230));
+    this.addLabel('Tap the field to fire', -HALF_W + 20, HALF_H - 126, 18, new Color(200, 200, 200));
   }
 
   private addLayer(name: string): Node {

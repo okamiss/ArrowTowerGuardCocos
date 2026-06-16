@@ -16,14 +16,17 @@
  */
 
 import { _decorator, Component, Sprite, SpriteFrame, UITransform } from 'cc';
+import { GameConfig } from '../core/GameConfig';
 import type { MonsterConfig, MonsterId } from '../core/GameConfig';
 
 const { ccclass } = _decorator;
 
 /** Result of advancing a monster one frame. */
 export enum MonsterStep {
+  /** Still walking, or stopped at the castle but not biting this frame. */
   Alive,
-  ReachedCastle,
+  /** Reached the castle and landed a hit this frame (apply `castleDamage`). */
+  AttackCastle,
 }
 
 @ccclass('Monster')
@@ -32,6 +35,12 @@ export class Monster extends Component {
   private hp = 0;
   private _active = false;
 
+  // Castle siege: once the monster reaches the castle line it stops moving and
+  // bites on a fixed interval. `attacking` latches on arrival; `attackTimer`
+  // counts down to the next hit.
+  private attacking = false;
+  private attackTimer = 0;
+
   get id(): MonsterId {
     return this.cfg.id;
   }
@@ -39,6 +48,11 @@ export class Monster extends Component {
   /** Gold awarded to the player on death. */
   get gold(): number {
     return this.cfg.gold;
+  }
+
+  /** Damage this monster deals to the castle per hit. */
+  get castleDamage(): number {
+    return this.cfg.castleDamage;
   }
 
   /** Hitbox radius (px) for the arrow distance test. */
@@ -65,21 +79,44 @@ export class Monster extends Component {
     this.cfg = cfg;
     this.hp = cfg.hp;
     this._active = true;
+    this.attacking = false;
+    this.attackTimer = 0;
     this.applyArt(frame);
     this.node.setPosition(x, y, 0);
     this.node.active = true;
   }
 
   /**
-   * Move left one frame. Returns ReachedCastle once the center crosses the
-   * castle hit line (the conductor then recycles it).
+   * Advance one frame. While walking it moves left; once it crosses the castle
+   * line it stops there and begins biting. Returns AttackCastle on the frames a
+   * bite lands (BattleManager then subtracts `castleDamage` from the castle);
+   * otherwise Alive. The monster keeps living (and stays a valid arrow target)
+   * until killed — it is never recycled just for reaching the castle.
    */
   step(dt: number, castleX: number): MonsterStep {
     if (!this._active) return MonsterStep.Alive;
+
+    if (this.attacking) {
+      this.attackTimer -= dt;
+      if (this.attackTimer <= 0) {
+        this.attackTimer += GameConfig.combat.castleAttackInterval;
+        return MonsterStep.AttackCastle;
+      }
+      return MonsterStep.Alive;
+    }
+
     const p = this.node.position;
     const nx = p.x - this.cfg.speed * dt;
+    if (nx <= castleX) {
+      // Snap to the castle line, latch into the attacking state, and let the
+      // first bite land on the very next step (attackTimer starts at 0).
+      this.node.setPosition(castleX, p.y, 0);
+      this.attacking = true;
+      this.attackTimer = 0;
+      return MonsterStep.Alive;
+    }
     this.node.setPosition(nx, p.y, 0);
-    return nx <= castleX ? MonsterStep.ReachedCastle : MonsterStep.Alive;
+    return MonsterStep.Alive;
   }
 
   /** Apply damage. Returns true if this hit killed the monster. */
@@ -93,6 +130,8 @@ export class Monster extends Component {
   deactivate(): void {
     this._active = false;
     this.hp = 0;
+    this.attacking = false;
+    this.attackTimer = 0;
     this.node.active = false;
   }
 
