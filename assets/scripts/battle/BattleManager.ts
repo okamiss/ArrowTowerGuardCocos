@@ -208,10 +208,7 @@ export class BattleManager extends Component {
     const due = this.levelManager.update(dt);
     if (due.length > 0) {
       for (const wave of due) this.spawner.spawnWave(wave);
-      this.updateWaveHud();
-      // Mirror the live within-level wave onto the profile (coalesced flush).
-      this.profile.currentWave = this.levelManager.currentWaveInLevel;
-      this.saveDirty = true;
+      this.updateWaveHud(); // runtime-only wave display; never persisted
     }
     this.spawner.update(dt, this.onMonsterSpawned);
 
@@ -325,10 +322,8 @@ export class BattleManager extends Component {
     const plan = this.levelManager.startLevel(); // starts the wave schedule (waves spawn over time)
     this.spawner.stop();             // drop any leftover spawn tasks
     this.paused = false;
-    // A level always (re)starts at wave 1; keep the persisted wave in sync so a
-    // reload resumes the saved level at wave 1 (waves are time-scheduled, not
-    // resumed mid-level — see WavePlan in GameConfig).
-    this.profile.currentWave = this.levelManager.currentWaveInLevel;
+    // A level always (re)starts at wave 1 (WaveManager resets its counter). This
+    // within-level wave is runtime-only and is never written to the save.
     this.battleUI?.refreshAll();
     console.log(`[BattleManager] startLevel ${plan.level} waves=${plan.totalWaves} monsters=${plan.totalCount} boss=${plan.hasBoss}`);
   }
@@ -424,9 +419,16 @@ export class BattleManager extends Component {
     return this.levelManager?.currentLevel ?? this.profile.currentLevel;
   }
 
-  /** Current WAVE (波) within the level, 1..wavesPerLevel. */
+  /**
+   * Current WAVE (波) within the level, 1..wavesPerLevel.
+   *
+   * Save policy: only LEVEL progress is persisted, never the within-level wave.
+   * On re-entry the battle restarts the saved level at wave 1/10. This value is
+   * runtime-only state owned by WaveManager (via LevelManager.currentWaveInLevel)
+   * — it is read here for display, never loaded from / written to the save.
+   */
   getCurrentWave(): number {
-    return this.levelManager?.currentWaveInLevel ?? this.profile.currentWave;
+    return this.levelManager?.currentWaveInLevel ?? 1;
   }
 
   /** Waves per level (default 10). */

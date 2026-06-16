@@ -45,14 +45,15 @@ export interface PlayerSaveData {
   gold: number;
   diamond: number;
 
-  /** Best level ever reached. */
+  /** Best level ever reached (the "best level" stat shown on the result screen). */
   highestLevel: number;
   /** Level the player is currently on / will resume at. */
   currentLevel: number;
-  /** Wave within the current level to resume at (1-based). Waves are otherwise
-   *  transient; this is persisted for forward-compat / mid-level resume. The MVP
-   *  resumes at wave 1 of `currentLevel`. */
-  currentWave: number;
+  // NOTE: only LEVEL progress is persisted — never the within-level wave.
+  // On re-entry the battle always restarts the saved level at wave 1/10. The
+  // live wave (WaveManager.currentWave / LevelManager.currentWaveInLevel) is
+  // runtime-only state and is intentionally NOT stored here. Legacy saves may
+  // still carry a `currentWave`; it is ignored on load (see SaveVersionManager).
 
   upgrades: UpgradeSaveData;
   skills: SkillSaveData;
@@ -87,7 +88,6 @@ export function createDefaultSaveData(): PlayerSaveData {
 
     highestLevel: 0,
     currentLevel: 1, // levels are 1-based (see GameConfig.levelConfigs)
-    currentWave: 1,  // waves are 1-based within a level
 
     upgrades: {
       damageLevel: 0,

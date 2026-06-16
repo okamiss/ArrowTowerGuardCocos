@@ -36,12 +36,12 @@ export class SaveVersionManager {
         highestLevel: data.highestLevel ?? highestWave ?? 0,
       };
     },
-    // v2 -> v3: introduce a persisted `currentWave` for the level the player is
-    // on. Old saves resume at wave 1 of their currentLevel.
+    // v2 -> v3: schema-compatible bump. (A short-lived persisted `currentWave`
+    // was dropped — only LEVEL progress is saved; the within-level wave is
+    // runtime-only and always restarts at 1. Legacy `currentWave` is ignored.)
     2: (data: any) => ({
       ...data,
       version: 3,
-      currentWave: data.currentWave ?? 1,
     }),
   };
 
@@ -93,12 +93,15 @@ export class SaveVersionManager {
   /** Merge `data` over a fresh default so every field is guaranteed present. */
   private static withDefaults(data: any): PlayerSaveData {
     const d = createDefaultSaveData();
+    // Strip deprecated fields so they are never re-persisted: this version saves
+    // only LEVEL progress, never the within-level wave (currentWave/bestWave).
+    const { currentWave, bestWave, highestWave, ...rest } = data;
     return {
       ...d,
-      ...data,
-      upgrades: { ...d.upgrades, ...(data.upgrades ?? {}) },
-      skills: { ...d.skills, ...(data.skills ?? {}) },
-      stats: { ...d.stats, ...(data.stats ?? {}) },
+      ...rest,
+      upgrades: { ...d.upgrades, ...(rest.upgrades ?? {}) },
+      skills: { ...d.skills, ...(rest.skills ?? {}) },
+      stats: { ...d.stats, ...(rest.stats ?? {}) },
       version: SaveVersionManager.currentVersion,
     };
   }

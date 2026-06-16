@@ -71,9 +71,9 @@ export class ResultPanel extends Component {
     // Title + stat rows (top -> bottom inside the card).
     this.addLabel('战斗结束', 0, 190, 48, new Color(220, 90, 80, 255), true);
     this.addLabel(`到达关卡：第 ${data.level} 关`, 0, 118, 30, new Color(235, 235, 235, 255), true);
-    this.addLabel(`击杀数量：${data.kills}`, 0, 70, 30, new Color(235, 235, 235, 255), true);
-    this.addLabel(`获得金币：${data.goldEarned}`, 0, 22, 30, new Color(255, 210, 63, 255), true);
-    this.addLabel(`最高关卡：第 ${data.highestLevel} 关`, 0, -26, 30, new Color(180, 220, 140, 255), true);
+    this.addLabel(`最高关卡：第 ${data.highestLevel} 关`, 0, 70, 30, new Color(180, 220, 140, 255), true);
+    this.addLabel(`击杀数量：${data.kills}`, 0, 22, 30, new Color(235, 235, 235, 255), true);
+    this.addLabel(`获得金币：${data.goldEarned}`, 0, -26, 30, new Color(255, 210, 63, 255), true);
 
     this.buildButton('重新开始', 0, -100, 280, 62, () => this.fire(this.data?.onRestart), true);
     this.buildButton('返回主界面', 0, -176, 280, 62, () => this.fire(this.data?.onReturnToMain), false);
