@@ -11,7 +11,11 @@
       "Bash(tsc -p tsconfig.json --noEmit)",
       "Bash(echo \"=== count: $\\(tsc -p tsconfig.json --noEmit 2>&1)",
       "Bash(ls tsconfig*.json)",
-      "Bash(ls node_modules/.bin/tsc)"
+      "Bash(ls node_modules/.bin/tsc)",
+      "Read(//d/d/000000code/AIcode01/ArrowTowerGuardCocos/assets/**)",
+      "Read(//d/000000code/AIcode01/**)",
+      "Bash(npx --no-install tsc --version)",
+      "Bash(echo \"EXIT\\(grep\\): $?\")"
     ]
   }
 }

@@ -36,6 +36,13 @@ export class SaveVersionManager {
         highestLevel: data.highestLevel ?? highestWave ?? 0,
       };
     },
+    // v2 -> v3: introduce a persisted `currentWave` for the level the player is
+    // on. Old saves resume at wave 1 of their currentLevel.
+    2: (data: any) => ({
+      ...data,
+      version: 3,
+      currentWave: data.currentWave ?? 1,
+    }),
   };
 
   static get currentVersion(): number {

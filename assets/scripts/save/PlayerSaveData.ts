@@ -49,6 +49,10 @@ export interface PlayerSaveData {
   highestLevel: number;
   /** Level the player is currently on / will resume at. */
   currentLevel: number;
+  /** Wave within the current level to resume at (1-based). Waves are otherwise
+   *  transient; this is persisted for forward-compat / mid-level resume. The MVP
+   *  resumes at wave 1 of `currentLevel`. */
+  currentWave: number;
 
   upgrades: UpgradeSaveData;
   skills: SkillSaveData;
@@ -83,6 +87,7 @@ export function createDefaultSaveData(): PlayerSaveData {
 
     highestLevel: 0,
     currentLevel: 1, // levels are 1-based (see GameConfig.levelConfigs)
+    currentWave: 1,  // waves are 1-based within a level
 
     upgrades: {
       damageLevel: 0,

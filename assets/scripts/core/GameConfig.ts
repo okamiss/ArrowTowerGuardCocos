@@ -80,9 +80,15 @@ export interface UpgradeConfig {
   readonly id: UpgradeId;
   readonly name: string;
   readonly baseCost: number;
-  readonly growth: number;         // cost(level) = ceil(baseCost * growth^level)
-  readonly maxLevel: number;
-  readonly perLevel: number;       // meaning is upgrade-specific (see DESIGN.md)
+  readonly growth: number;         // cost(level) = floor(baseCost * growth^level)
+  /**
+   * Effect magnitude per level — UNITS DIFFER per upgrade (see UpgradeSystem):
+   *   damage      -> +flat arrow damage per level
+   *   attackSpeed -> -ms shaved off the attack interval per level
+   *   crit        -> +crit rate (fraction 0..1) per level
+   *   castleHp    -> +max castle HP per level
+   */
+  readonly perLevel: number;
 }
 
 // ----- Config --------------------------------------------------------------
@@ -99,16 +105,26 @@ export const GameConfig = {
     towerMuzzle: { x: 180, y: 260 }, // where arrows launch from
   },
 
-  /** Base player/tower stats (before upgrades). */
+  /**
+   * Base player/tower stats (before upgrades). The permanent-upgrade system
+   * (UpgradeSystem) derives the live battle attributes from these + the upgrade
+   * levels; nothing else hard-codes these numbers.
+   *
+   * Attack speed is modeled as an attack INTERVAL in milliseconds (designer-
+   * friendly), reduced linearly per attackSpeed level down to a hard floor.
+   * `*FireCooldown` are the SECONDS mirrors the runtime archer consumes
+   * (interval_ms / 1000); keep them in sync with the *AttackIntervalMs values.
+   */
   player: {
-    baseDamage: 10,
-    baseFireCooldown: 0.40,   // seconds between shots at level 0
-    minFireCooldown: 0.10,    // hard floor regardless of upgrades
-    cooldownFactor: 0.96,     // fireCooldown *= cooldownFactor ^ attackSpeedLevel
-    baseCritChance: 0.05,
-    critChanceCap: 0.60,
-    critMultiplier: 2.0,
-    baseCastleHp: 200,
+    baseDamage: 10,                // arrow damage at level 0
+    baseAttackIntervalMs: 500,     // ms between shots at level 0
+    minAttackIntervalMs: 180,      // fastest allowed interval (attack-speed cap)
+    baseFireCooldown: 0.50,        // seconds mirror of baseAttackIntervalMs
+    minFireCooldown: 0.18,         // seconds mirror of minAttackIntervalMs (ArcherController floor)
+    baseCritRate: 0,               // crit chance (0..1) at level 0
+    critChanceCap: 0.50,           // max crit chance (crit cap)
+    critMultiplier: 2.0,           // crit damage multiplier (DamageSystem)
+    baseCastleHp: 1000,            // castle max HP at level 0
   },
 
   /** Projectile behavior. */
@@ -210,23 +226,35 @@ export const GameConfig = {
     bossHpGrowthPerLevel: 0.25,    // +25% boss HP per boss tier (per 10 levels)
   },
 
-  /** Permanent upgrades (see DESIGN.md §6). `perLevel` meaning:
-   *   damage      -> +flat damage per level
-   *   attackSpeed -> unused (cooldown uses player.cooldownFactor); kept for UI display
-   *   crit        -> +crit chance (fraction) per level
-   *   castleHp    -> +max HP per level
+  /**
+   * Permanent (out-of-battle) upgrades, bought on the main menu and applied at
+   * battle start. `cost(level) = floor(baseCost * growth^level)`; the effect is
+   * `perLevel` (units per UpgradeConfig). Caps are derived, not stored here:
+   * attackSpeed is capped by `player.minAttackIntervalMs`, crit by
+   * `player.critChanceCap`; damage and castleHp are uncapped. Names are the
+   * display strings shown by both upgrade panels.
    */
   upgrades: {
-    damage:      { id: 'damage',      name: 'Damage',       baseCost: 50, growth: 1.18, maxLevel: 50, perLevel: 5 },
-    attackSpeed: { id: 'attackSpeed', name: 'Attack Speed', baseCost: 60, growth: 1.20, maxLevel: 50, perLevel: 0.04 },
-    crit:        { id: 'crit',        name: 'Crit Chance',  baseCost: 75, growth: 1.22, maxLevel: 50, perLevel: 0.015 },
-    castleHp:    { id: 'castleHp',    name: 'Castle HP',    baseCost: 80, growth: 1.16, maxLevel: 50, perLevel: 40 },
+    damage:      { id: 'damage',      name: '箭矢伤害', baseCost: 100, growth: 1.35, perLevel: 5 },
+    attackSpeed: { id: 'attackSpeed', name: '攻击速度', baseCost: 120, growth: 1.35, perLevel: 35 },
+    crit:        { id: 'crit',        name: '暴击率',   baseCost: 150, growth: 1.35, perLevel: 0.01 },
+    castleHp:    { id: 'castleHp',    name: '城墙血量', baseCost: 100, growth: 1.35, perLevel: 100 },
   } as Record<UpgradeId, UpgradeConfig>,
+
+  /** Scene names as authored in the Cocos editor. SINGLE SOURCE OF TRUTH for
+   *  director.loadScene targets — never hard-code scene name strings elsewhere.
+   *  `battle` is the existing scene asset (assets/scene.scene, _name "scene");
+   *  `main` is the new MainScene the editor must contain (see README/manual
+   *  setup). Keep these in sync with the actual .scene asset names. */
+  scenes: {
+    main: 'MainScene',
+    battle: 'scene',
+  },
 
   /** Save layer. */
   save: {
     storageKey: 'arrowtowerguard.save',
-    version: 2,
+    version: 3,
     /** Default persistence backend; SaveServiceFactory reads this. */
     backend: 'local' as 'local' | 'cloud',
     /** Coalesce window (s): gold-earning kills are flushed to storage at most
@@ -252,10 +280,12 @@ export const GameConfig = {
 
 // ----- Derived helpers (pure) ----------------------------------------------
 
-/** Cost to buy the NEXT level (i.e. to go from `level` -> `level+1`). */
+/** Cost to buy the NEXT level (i.e. to go from `level` -> `level+1`).
+ *  `floor(baseCost * growth^level)` — e.g. damage L0->L1 = 100, castleHp L2->L3
+ *  = floor(100 * 1.35^2) = 182. */
 export function upgradeCost(id: UpgradeId, level: number): number {
   const c = GameConfig.upgrades[id];
-  return Math.ceil(c.baseCost * Math.pow(c.growth, level));
+  return Math.floor(c.baseCost * Math.pow(c.growth, level));
 }
 
 /** The monster combo active at `level` (highest unlockLevel ≤ level). */
