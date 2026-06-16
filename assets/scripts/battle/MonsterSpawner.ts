@@ -2,16 +2,17 @@
  * MonsterSpawner.ts
  * ----------------------------------------------------------------------------
  * Pulls monsters from an ObjectPool and places them at the right-edge spawn
- * point on a timer. Owns the monster pool so MVP demos never instantiate/destroy
- * enemies per kill (see performance rules).
+ * point on a timer. Owns the monster pool so the battle never instantiates /
+ * destroys enemies per kill (see performance rules).
  *
- * For this minimal demo it spawns an ENDLESS stream: the GameConfig wave table
- * is flattened into a spawn queue (each entry carries its wave's spawnInterval),
- * and the cursor loops back to the start when the queue is exhausted so the
- * battlefield keeps producing targets. WaveManager (separate concern) will later
- * own real wave start/clear logic; the spawner stays a thin, config-driven pump.
+ * It is a thin, plan-driven pump. BattleManager calls `spawnWave(wave)` each
+ * time a wave becomes due; the spawner turns that wave into a per-monster spawn
+ * TASK and emits one monster per `spawnInterval`. Several tasks can run at once
+ * (waves are time-scheduled and overlap), so the spawner advances all active
+ * tasks every frame and drops each one when its monsters are exhausted.
  *
- * No flow/economy logic here: it only spawns and recycles monster nodes.
+ * It does NOT decide when a wave/level is cleared, does NOT count alive monsters,
+ * does NOT save, and owns NO UI — those are LevelManager / BattleManager.
  * ----------------------------------------------------------------------------
  */
 
@@ -19,12 +20,23 @@ import { Node, UITransform, Sprite, SpriteFrame, Layers } from 'cc';
 import { ObjectPool } from '../core/ObjectPool';
 import { Monster } from '../monster/Monster';
 import { GameConfig } from '../core/GameConfig';
-import type { MonsterId } from '../core/GameConfig';
+import type { MonsterId, WavePlan } from '../core/GameConfig';
 
+/** One queued spawn carrying its level-scaled stats. */
 interface SpawnTicket {
   readonly id: MonsterId;
-  readonly interval: number; // seconds to wait before the NEXT spawn
-  readonly wave: number;     // 1-based wave this monster belongs to
+  readonly hp: number;
+  readonly gold: number;
+  readonly castleDamage: number;
+  readonly speed: number;
+}
+
+/** An in-flight wave: a queue of monsters drained on its own cadence. */
+interface SpawnTask {
+  readonly queue: SpawnTicket[];
+  cursor: number;
+  timer: number;
+  readonly interval: number;
 }
 
 /** Resolves the preloaded SpriteFrame for a monster type. */
@@ -32,15 +44,9 @@ export type MonsterFrameProvider = (id: MonsterId) => SpriteFrame | null;
 
 export class MonsterSpawner {
   private readonly pool: ObjectPool<Monster>;
-  private readonly queue: SpawnTicket[];
-  private cursor = 0;
-  private timer = 0;
-  private _currentWave = GameConfig.waves.length > 0 ? GameConfig.waves[0].index : 1;
 
-  /** 1-based index of the wave the most recently spawned monster belongs to. */
-  get currentWave(): number {
-    return this._currentWave;
-  }
+  // Active spawn tasks (one per live wave). Multiple may run concurrently.
+  private readonly tasks: SpawnTask[] = [];
 
   // Design-space (bottom-left origin) -> center-origin offsets.
   private static readonly HALF_W = GameConfig.layout.designWidth / 2;
@@ -56,23 +62,44 @@ export class MonsterSpawner {
       (monster) => monster.deactivate(),
       prewarm,
     );
-    this.queue = MonsterSpawner.buildQueue();
+  }
+
+  /** Queue a newly-triggered wave as a concurrent spawn task. */
+  spawnWave(wave: WavePlan): void {
+    const queue = MonsterSpawner.flatten(wave);
+    if (queue.length === 0) return;
+    this.tasks.push({ queue, cursor: 0, timer: 0, interval: wave.spawnInterval });
   }
 
   /**
-   * Advance the spawn clock. When the interval elapses, spawn the next queued
-   * monster and hand it to `onSpawn` (the conductor tracks it as active).
+   * Advance every active spawn task. Each emits one monster per its interval
+   * (catching up if `dt` covers several) and is dropped once exhausted. Spawned
+   * monsters are handed to `onSpawn` (BattleManager tracks them + counts).
    */
   update(dt: number, onSpawn: (monster: Monster) => void): void {
-    if (this.queue.length === 0) return;
-    this.timer -= dt;
-    if (this.timer > 0) return;
+    for (let i = this.tasks.length - 1; i >= 0; i--) {
+      const task = this.tasks[i];
+      task.timer -= dt;
+      while (task.timer <= 0 && task.cursor < task.queue.length) {
+        onSpawn(this.spawnOne(task.queue[task.cursor++]));
+        task.timer += task.interval;
+      }
+      if (task.cursor >= task.queue.length) {
+        // Swap-remove the finished task.
+        this.tasks[i] = this.tasks[this.tasks.length - 1];
+        this.tasks.pop();
+      }
+    }
+  }
 
-    const ticket = this.queue[this.cursor];
-    this.timer = ticket.interval;
-    this._currentWave = ticket.wave;
-    this.cursor = (this.cursor + 1) % this.queue.length; // endless loop
-    onSpawn(this.spawnOne(ticket.id));
+  /** True while any wave still has monsters left to spawn. */
+  get hasPendingSpawns(): boolean {
+    return this.tasks.length > 0;
+  }
+
+  /** Halt all spawning immediately (e.g. on level complete / defeat). */
+  stop(): void {
+    this.tasks.length = 0;
   }
 
   /** Recycle a dead / castle-reaching monster back into the pool. */
@@ -80,25 +107,34 @@ export class MonsterSpawner {
     this.pool.put(monster);
   }
 
-  private spawnOne(id: MonsterId): Monster {
-    const cfg = GameConfig.monsters[id];
+  private spawnOne(ticket: SpawnTicket): Monster {
+    const cfg = GameConfig.monsters[ticket.id];
     const laneY = cfg.lane === 'air' ? GameConfig.layout.airY : GameConfig.layout.groundY;
     const x = GameConfig.layout.spawnX - MonsterSpawner.HALF_W;
     const y = laneY - MonsterSpawner.HALF_H;
 
     const monster = this.pool.get();
-    monster.spawn(cfg, x, y, this.frameFor(id));
+    monster.spawn(cfg, x, y, this.frameFor(ticket.id), {
+      hp: ticket.hp,
+      gold: ticket.gold,
+      castleDamage: ticket.castleDamage,
+      speed: ticket.speed,
+    });
     return monster;
   }
 
-  /** Flatten the wave table into one spawn ticket per individual monster. */
-  private static buildQueue(): SpawnTicket[] {
+  /** Flatten a wave into one spawn ticket per individual monster. */
+  private static flatten(wave: WavePlan): SpawnTicket[] {
     const q: SpawnTicket[] = [];
-    for (const wave of GameConfig.waves) {
-      for (const spawn of wave.spawns) {
-        for (let i = 0; i < spawn.count; i++) {
-          q.push({ id: spawn.monster, interval: wave.spawnInterval, wave: wave.index });
-        }
+    for (const spawn of wave.spawns) {
+      for (let i = 0; i < spawn.count; i++) {
+        q.push({
+          id: spawn.id,
+          hp: spawn.hp,
+          gold: spawn.gold,
+          castleDamage: spawn.castleDamage,
+          speed: spawn.speed,
+        });
       }
     }
     return q;

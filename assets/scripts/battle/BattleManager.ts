@@ -24,8 +24,8 @@ import {
   _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Color, Vec3, Label,
   input, Input, EventTouch, EventMouse, director,
 } from 'cc';
-import { GameConfig, TOTAL_WAVES } from '../core/GameConfig';
-import type { MonsterId } from '../core/GameConfig';
+import { GameConfig } from '../core/GameConfig';
+import type { MonsterId, UpgradeId } from '../core/GameConfig';
 import { eventBus, GameEvent } from '../core/EventBus';
 import { Wallet } from '../economy/Wallet';
 import { UpgradeSystem } from '../upgrades/UpgradeSystem';
@@ -45,6 +45,10 @@ import { DamageSystem } from './DamageSystem';
 import { Castle } from './Castle';
 import { ArcherController } from '../player/ArcherController';
 import { ResultPanel } from '../ui/ResultPanel';
+import { UpgradePanel } from '../ui/UpgradePanel';
+import type { UpgradeRowData } from '../ui/UpgradePanel';
+import { LevelManager, LevelState } from '../level/LevelManager';
+import { WaveManager } from '../level/WaveManager';
 
 const { ccclass } = _decorator;
 
@@ -69,6 +73,7 @@ export class BattleManager extends Component {
   private damageSystem!: DamageSystem;
   private castle!: Castle;
   private archer!: ArcherController;
+  private levelManager!: LevelManager;
 
   // --- art ---
   private readonly frames = new Map<string, SpriteFrame | null>();
@@ -78,14 +83,25 @@ export class BattleManager extends Component {
   private readonly arrows: Arrow[] = [];
   private readonly monsters: Monster[] = [];
 
+  // --- level / monster bookkeeping (drives level-complete detection) ---
+  private aliveMonsterCount = 0;
+  private totalSpawnedMonsterCount = 0;
+  private totalKilledMonsterCount = 0;
+  private levelCompleteTimer = 0; // grace countdown once the field empties
+
   // --- save coalescing ---
   private saveDirty = false;
   private saveTimer = 0;
 
   private booted = false;
-  private over = false; // latched on defeat: stops spawning, movement, and firing
+  private over = false;   // latched on defeat: stops spawning, movement, and firing
+  private paused = false; // true while the between-level UpgradePanel is up
   private goldLabel: Label | null = null;
   private castleHpLabel: Label | null = null;
+  private levelLabel: Label | null = null;
+  private waveLabel: Label | null = null;
+  private upgradePanel: UpgradePanel | null = null;
+  private upgradePanelNode: Node | null = null;
 
   // Per-run tallies shown on the result screen (reset every battle).
   private runKills = 0;
@@ -120,6 +136,7 @@ export class BattleManager extends Component {
     eventBus.on(GameEvent.GoldChanged, this.onGoldChanged, this);
     eventBus.on(GameEvent.MonsterKilled, this.onMonsterKilled, this);
     eventBus.on(GameEvent.CastleHpChanged, this.onCastleHpChanged, this);
+    eventBus.on(GameEvent.LevelStarted, this.onLevelStarted, this);
 
     // --- preload real art, then build the scene ---
     await this.preloadArt();
@@ -152,6 +169,11 @@ export class BattleManager extends Component {
 
     // Seed gold from the save -> emits GoldChanged -> refreshes the HUD.
     this.wallet.setGold(this.profile.gold);
+
+    // Level flow: resume at the saved currentLevel and start its time-scheduled waves.
+    this.levelManager = new LevelManager(this.profile, new WaveManager());
+    this.startCurrentLevel();
+
     this.booted = true;
   }
 
@@ -168,14 +190,56 @@ export class BattleManager extends Component {
   }
 
   protected update(dt: number): void {
-    if (!this.booted || this.over) return; // defeat freezes spawning/movement/firing
+    // defeat freezes everything; the between-level panel pauses the battle.
+    if (!this.booted || this.over || this.paused) return;
 
     this.archer.tick(dt);
     if (this.firing) this.fireAtAim(); // continuous fire, gated by cooldown
-    this.spawner.update(dt, (m) => this.monsters.push(m));
+
+    // Time-scheduled waves: any wave whose startTime elapsed this tick begins
+    // spawning now — it does NOT wait for earlier waves to be cleared.
+    const due = this.levelManager.update(dt);
+    if (due.length > 0) {
+      for (const wave of due) this.spawner.spawnWave(wave);
+      this.updateWaveHud();
+    }
+    this.spawner.update(dt, this.onMonsterSpawned);
+
     this.stepMonsters(dt);
     this.stepArrowsAndCollide(dt);
+    this.checkLevelCompletion(dt);
     this.tickSave(dt);
+  }
+
+  /** Track a freshly spawned monster (called by the spawner). */
+  private readonly onMonsterSpawned = (m: Monster): void => {
+    this.monsters.push(m);
+    this.aliveMonsterCount += 1;
+    this.totalSpawnedMonsterCount += 1;
+  };
+
+  /**
+   * The level finishes only when ALL three hold: every wave has been triggered,
+   * the spawner has no monsters left to emit, and the field is empty — then a
+   * short grace delay. Triggering wave 10 or finishing its spawn is NOT enough.
+   */
+  private checkLevelCompletion(dt: number): void {
+    if (this.levelManager.currentState !== LevelState.Fighting) return;
+
+    const ready =
+      this.levelManager.allWavesTriggered &&
+      !this.spawner.hasPendingSpawns &&
+      this.aliveMonsterCount <= 0;
+    if (!ready) {
+      this.levelCompleteTimer = 0;
+      return;
+    }
+
+    this.levelCompleteTimer += dt;
+    if (this.levelCompleteTimer >= GameConfig.levelConfigs.levelCompleteDelay) {
+      this.levelManager.complete(); // emits LevelCleared
+      this.onLevelComplete();
+    }
   }
 
   // --- per-frame battle path ----------------------------------------------
@@ -198,39 +262,143 @@ export class BattleManager extends Component {
 
   /**
    * Castle HP hit 0. Latch the over flag (freezes the next update), persist the
-   * run's outcome (highest wave + lifetime totals), announce GameOver, and pop
-   * the result summary.
+   * run's outcome (highest level + lifetime totals), announce GameOver, and pop
+   * the result summary. currentLevel is left as-is so the player retries the
+   * level they fell on (it only advances on a clear).
    */
   private onDefeat(): void {
     if (this.over) return;
     this.over = true;
+    this.paused = false;
     this.firing = false;
+    this.spawner.stop();
 
-    const wave = this.spawner.currentWave;
+    const level = this.levelManager.currentLevel;
     this.profile.stats.totalGames += 1;
-    if (wave > this.profile.highestWave) this.profile.highestWave = wave;
-    this.profile.currentWave = wave;
+    if (level > this.profile.highestLevel) this.profile.highestLevel = level;
+    this.profile.currentLevel = level;
     this.flushSave('defeat'); // immediate, not coalesced: the run just ended
 
     eventBus.emit(GameEvent.GameOver, { result: 'lose' });
-    console.log(`[BattleManager] DEFEAT wave=${wave} kills=${this.runKills} gold=${this.runGoldEarned}`);
+    console.log(`[BattleManager] DEFEAT level=${level} kills=${this.runKills} gold=${this.runGoldEarned}`);
 
-    this.showResultPanel(wave);
+    this.showResultPanel(level);
   }
 
   /** Build and display the (simple) end-of-run summary overlay. */
-  private showResultPanel(wave: number): void {
+  private showResultPanel(level: number): void {
     const node = new Node('ResultPanel');
     node.layer = Layers.Enum.UI_2D;
     this.node.addChild(node);
     const panel = node.addComponent(ResultPanel);
     panel.show({
-      wave,
+      level,
       kills: this.runKills,
       goldEarned: this.runGoldEarned,
-      highestWave: this.profile.highestWave,
+      highestLevel: this.profile.highestLevel,
       onRestart: () => this.restart(),
     });
+  }
+
+  // --- level flow -----------------------------------------------------------
+
+  /** Start (or restart) the current level: reset counters and begin its schedule. */
+  private startCurrentLevel(): void {
+    this.clearActiveEntities();      // defensive: no leftovers from a prior level
+    this.aliveMonsterCount = 0;
+    this.totalSpawnedMonsterCount = 0;
+    this.totalKilledMonsterCount = 0;
+    this.levelCompleteTimer = 0;
+
+    const plan = this.levelManager.startLevel(); // starts the wave schedule (waves spawn over time)
+    this.spawner.stop();             // drop any leftover spawn tasks
+    this.updateWaveHud();
+    this.paused = false;
+    console.log(`[BattleManager] startLevel ${plan.level} waves=${plan.totalWaves} monsters=${plan.totalCount} boss=${plan.hasBoss}`);
+  }
+
+  /**
+   * Every monster for the current level is dead. Stop spawning, pause the battle,
+   * persist progress, and show the upgrade overlay. (currentLevel advances only
+   * when the player taps "continue".)
+   */
+  private onLevelComplete(): void {
+    if (this.over || this.paused) return;
+    this.paused = true;
+    this.firing = false;
+    this.spawner.stop();
+    this.profile.gold = this.wallet.getGold();
+    this.flushSave('level-clear');
+    this.showUpgradePanel();
+    console.log(`[BattleManager] level ${this.levelManager.currentLevel} CLEARED`);
+  }
+
+  /** Build and display the between-level upgrade + continue overlay. */
+  private showUpgradePanel(): void {
+    const node = new Node('UpgradePanel');
+    node.layer = Layers.Enum.UI_2D;
+    this.node.addChild(node);
+    this.upgradePanelNode = node;
+    this.upgradePanel = node.addComponent(UpgradePanel);
+    this.upgradePanel.show({
+      level: this.levelManager.currentLevel,
+      getGold: () => this.wallet.getGold(),
+      getRows: () => this.buildUpgradeRows(),
+      onBuy: (id) => this.buyUpgrade(id),
+      onContinue: () => this.continueToNextLevel(),
+    });
+  }
+
+  /** Snapshot the 4 MVP upgrades for the panel. */
+  private buildUpgradeRows(): UpgradeRowData[] {
+    const ids: UpgradeId[] = ['damage', 'attackSpeed', 'crit', 'castleHp'];
+    const gold = this.wallet.getGold();
+    return ids.map((id) => ({
+      id,
+      name: GameConfig.upgrades[id].name,
+      level: this.upgrades.getLevel(id),
+      maxed: this.upgrades.isMaxed(id),
+      cost: this.upgrades.getNextCost(id),
+      affordable: this.upgrades.canAfford(id, gold),
+    }));
+  }
+
+  /** Apply a purchase: deduct gold, recompute stats, mark the save dirty. */
+  private buyUpgrade(id: UpgradeId): void {
+    if (!this.upgrades.canAfford(id, this.wallet.getGold())) return;
+    const cost = this.upgrades.purchase(id);
+    if (cost === null) return;
+    this.wallet.spendGold(cost);                 // emits GoldChanged -> HUD + profile mirror
+    this.stats = this.upgrades.computeStats();   // archer reads stats live via closure
+    eventBus.emit(GameEvent.UpgradePurchased, { id, level: this.upgrades.getLevel(id) });
+    this.saveDirty = true;                       // coalesced; the level-clear flush also covers it
+  }
+
+  /** Player tapped "continue": advance, refill the castle, persist, next level. */
+  private continueToNextLevel(): void {
+    this.levelManager.nextLevel(); // bumps profile.currentLevel + highestLevel
+    this.flushSave('next-level');  // persist currentLevel / highestLevel immediately
+
+    // Refill the castle to its (possibly upgraded) max HP for the new level.
+    this.stats = this.upgrades.computeStats();
+    this.castle = new Castle(this.stats.castleMaxHp); // emits CastleHpChanged -> HUD
+
+    this.destroyUpgradePanel();
+    this.startCurrentLevel();
+  }
+
+  /** Recycle every active arrow/monster back to its pool (between levels). */
+  private clearActiveEntities(): void {
+    for (const m of this.monsters) this.spawner.recycle(m);
+    this.monsters.length = 0;
+    for (const a of this.arrows) this.arrowPool.put(a);
+    this.arrows.length = 0;
+  }
+
+  private destroyUpgradePanel(): void {
+    this.upgradePanelNode?.destroy();
+    this.upgradePanelNode = null;
+    this.upgradePanel = null;
   }
 
   /** Reload the scene for a fresh run (re-runs GameSceneController -> BattleManager). */
@@ -290,14 +458,14 @@ export class BattleManager extends Component {
 
   /** Press: start firing and aim at the press point. */
   private onPointerDown(e: EventTouch | EventMouse): void {
-    if (!this.booted || this.over) return;
+    if (!this.booted || this.over || this.paused) return;
     this.firing = true;
     this.updateAim(e);
   }
 
   /** Move: while held, retarget to follow the pointer. */
   private onPointerMove(e: EventTouch | EventMouse): void {
-    if (!this.booted || !this.firing) return;
+    if (!this.booted || this.paused || !this.firing) return;
     this.updateAim(e);
   }
 
@@ -337,7 +505,23 @@ export class BattleManager extends Component {
     this.profile.stats.totalKills += 1;
     this.profile.stats.totalGoldEarned += p.gold;
     this.saveDirty = true; // coalesced flush; never write per tick
-    console.log(`[BattleManager] killMonster id=${p.id} +${p.gold} gold (total gold=${this.wallet.getGold()})`);
+
+    // Field bookkeeping: a kill removes one live monster. Level completion is
+    // decided by checkLevelCompletion() once the field is empty.
+    this.totalKilledMonsterCount += 1;
+    this.aliveMonsterCount = Math.max(0, this.aliveMonsterCount - 1);
+  }
+
+  private onLevelStarted(p: { level: number; totalWaves: number }): void {
+    if (this.levelLabel) this.levelLabel.string = `LEVEL ${p.level}`;
+    this.updateWaveHud();
+  }
+
+  /** Refresh the "WAVE w / N" HUD line from the level manager. */
+  private updateWaveHud(): void {
+    if (this.waveLabel) {
+      this.waveLabel.string = `WAVE ${this.levelManager.currentWaveInLevel} / ${this.levelManager.wavesPerLevel}`;
+    }
   }
 
   private onCastleHpChanged(p: { hp: number; maxHp: number }): void {
@@ -424,8 +608,9 @@ export class BattleManager extends Component {
   private buildHud(): void {
     this.goldLabel = this.addLabel('Gold: 0', -HALF_W + 20, HALF_H - 30, 26, hexToColor(GameConfig.colors.damageCrit));
     this.castleHpLabel = this.addLabel('Castle: -- / --', -HALF_W + 20, HALF_H - 64, 24, new Color(120, 220, 120));
-    this.addLabel(`WAVE 1 / ${TOTAL_WAVES}`, -HALF_W + 20, HALF_H - 96, 20, new Color(230, 230, 230));
-    this.addLabel('Tap the field to fire', -HALF_W + 20, HALF_H - 126, 18, new Color(200, 200, 200));
+    this.levelLabel = this.addLabel('LEVEL --', -HALF_W + 20, HALF_H - 96, 20, new Color(230, 230, 230));
+    this.waveLabel = this.addLabel('WAVE -- / --', -HALF_W + 20, HALF_H - 124, 20, new Color(220, 200, 150));
+    this.addLabel('Hold the field to fire', -HALF_W + 20, HALF_H - 152, 18, new Color(200, 200, 200));
   }
 
   private addLayer(name: string): Node {

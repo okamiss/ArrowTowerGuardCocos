@@ -16,8 +16,8 @@ export enum GameEvent {
   GoldChanged = 'gold-changed',
   MonsterKilled = 'monster-killed',
   CastleHpChanged = 'castle-hp-changed',
-  WaveStarted = 'wave-started',
-  WaveCleared = 'wave-cleared',
+  LevelStarted = 'level-started',
+  LevelCleared = 'level-cleared',
   UpgradePurchased = 'upgrade-purchased',
   GameStateChanged = 'game-state-changed',
   GameOver = 'game-over',
@@ -30,8 +30,8 @@ export interface GameEventPayload {
   [GameEvent.GoldChanged]: { gold: number };
   [GameEvent.MonsterKilled]: { id: MonsterId; gold: number };
   [GameEvent.CastleHpChanged]: { hp: number; maxHp: number };
-  [GameEvent.WaveStarted]: { index: number; total: number };
-  [GameEvent.WaveCleared]: { index: number };
+  [GameEvent.LevelStarted]: { level: number; totalWaves: number };
+  [GameEvent.LevelCleared]: { level: number };
   [GameEvent.UpgradePurchased]: { id: UpgradeId; level: number };
   [GameEvent.GameStateChanged]: { from: string; to: string };
   [GameEvent.GameOver]: { result: 'win' | 'lose' };

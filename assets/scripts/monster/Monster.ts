@@ -29,11 +29,28 @@ export enum MonsterStep {
   AttackCastle,
 }
 
+/**
+ * Per-spawn stat overrides. The level system scales a monster's HP/gold/etc by
+ * the current level (see GameConfig.buildLevelPlan), so spawn() takes the
+ * resolved numbers instead of always using the static MonsterConfig defaults.
+ */
+export interface MonsterStats {
+  readonly hp: number;
+  readonly gold: number;
+  readonly castleDamage: number;
+  readonly speed: number;
+}
+
 @ccclass('Monster')
 export class Monster extends Component {
   private cfg!: MonsterConfig;
   private hp = 0;
   private _active = false;
+
+  // Level-scaled stats for THIS spawn (fall back to cfg defaults if omitted).
+  private _gold = 0;
+  private _castleDamage = 0;
+  private _speed = 0;
 
   // Castle siege: once the monster reaches the castle line it stops moving and
   // bites on a fixed interval. `attacking` latches on arrival; `attackTimer`
@@ -45,14 +62,19 @@ export class Monster extends Component {
     return this.cfg.id;
   }
 
-  /** Gold awarded to the player on death. */
+  /** Gold awarded to the player on death (level-scaled). */
   get gold(): number {
-    return this.cfg.gold;
+    return this._gold;
   }
 
-  /** Damage this monster deals to the castle per hit. */
+  /** Damage this monster deals to the castle per hit (level-scaled). */
   get castleDamage(): number {
-    return this.cfg.castleDamage;
+    return this._castleDamage;
+  }
+
+  /** True if this spawn is a boss (drives any boss-specific presentation). */
+  get isBoss(): boolean {
+    return this.cfg.isBoss === true;
   }
 
   /** Hitbox radius (px) for the arrow distance test. */
@@ -74,10 +96,17 @@ export class Monster extends Component {
     return this.node.position.y;
   }
 
-  /** Configure for a (re)spawn of `cfg` at the given position with its art. */
-  spawn(cfg: MonsterConfig, x: number, y: number, frame: SpriteFrame | null): void {
+  /**
+   * Configure for a (re)spawn of `cfg` at the given position with its art.
+   * `stats` carries the level-scaled numbers; when omitted the static
+   * MonsterConfig defaults are used (e.g. in tests / direct spawns).
+   */
+  spawn(cfg: MonsterConfig, x: number, y: number, frame: SpriteFrame | null, stats?: MonsterStats): void {
     this.cfg = cfg;
-    this.hp = cfg.hp;
+    this.hp = stats?.hp ?? cfg.hp;
+    this._gold = stats?.gold ?? cfg.gold;
+    this._castleDamage = stats?.castleDamage ?? cfg.castleDamage;
+    this._speed = stats?.speed ?? cfg.speed;
     this._active = true;
     this.attacking = false;
     this.attackTimer = 0;
@@ -106,7 +135,7 @@ export class Monster extends Component {
     }
 
     const p = this.node.position;
-    const nx = p.x - this.cfg.speed * dt;
+    const nx = p.x - this._speed * dt;
     if (nx <= castleX) {
       // Snap to the castle line, latch into the attacking state, and let the
       // first bite land on the very next step (attackTimer starts at 0).
@@ -130,6 +159,9 @@ export class Monster extends Component {
   deactivate(): void {
     this._active = false;
     this.hp = 0;
+    this._gold = 0;
+    this._castleDamage = 0;
+    this._speed = 0;
     this.attacking = false;
     this.attackTimer = 0;
     this.node.active = false;

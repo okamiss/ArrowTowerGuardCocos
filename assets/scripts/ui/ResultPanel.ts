@@ -27,14 +27,14 @@ const HALF_H = GameConfig.layout.designHeight / 2;
 
 /** Everything the panel displays, plus the restart hook. */
 export interface ResultData {
-  /** Wave reached this run. */
-  wave: number;
+  /** Level reached this run. */
+  level: number;
   /** Monsters killed this run. */
   kills: number;
   /** Gold earned this run. */
   goldEarned: number;
-  /** Best wave ever reached (post-save). */
-  highestWave: number;
+  /** Best level ever reached (post-save). */
+  highestLevel: number;
   /** Invoked when the player taps "Restart". */
   onRestart: () => void;
 }
@@ -68,10 +68,10 @@ export class ResultPanel extends Component {
 
     // Title + stat rows (top -> bottom inside the card).
     this.addLabel('DEFEAT', 0, 150, 48, new Color(220, 90, 80, 255), true);
-    this.addLabel(`Wave Reached:  ${data.wave}`, 0, 78, 30, new Color(235, 235, 235, 255), true);
+    this.addLabel(`Level Reached:  ${data.level}`, 0, 78, 30, new Color(235, 235, 235, 255), true);
     this.addLabel(`Kills:  ${data.kills}`, 0, 30, 30, new Color(235, 235, 235, 255), true);
     this.addLabel(`Gold Earned:  ${data.goldEarned}`, 0, -18, 30, new Color(255, 210, 63, 255), true);
-    this.addLabel(`Best Wave:  ${data.highestWave}`, 0, -66, 30, new Color(180, 220, 140, 255), true);
+    this.addLabel(`Best Level:  ${data.highestLevel}`, 0, -66, 30, new Color(180, 220, 140, 255), true);
 
     this.buildRestartButton(0, -150, 220, 64);
   }

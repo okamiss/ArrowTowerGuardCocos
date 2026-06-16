@@ -45,8 +45,10 @@ export interface PlayerSaveData {
   gold: number;
   diamond: number;
 
-  highestWave: number;
-  currentWave: number;
+  /** Best level ever reached. */
+  highestLevel: number;
+  /** Level the player is currently on / will resume at. */
+  currentLevel: number;
 
   upgrades: UpgradeSaveData;
   skills: SkillSaveData;
@@ -79,8 +81,8 @@ export function createDefaultSaveData(): PlayerSaveData {
     gold: 0,
     diamond: 0,
 
-    highestWave: 0,
-    currentWave: 1, // waves are 1-based (see GameConfig.waves)
+    highestLevel: 0,
+    currentLevel: 1, // levels are 1-based (see GameConfig.levelConfigs)
 
     upgrades: {
       damageLevel: 0,

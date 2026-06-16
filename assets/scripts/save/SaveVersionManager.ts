@@ -24,7 +24,18 @@ export class SaveVersionManager {
    *   1: (data) => ({ ...data, version: 2, prestigeLevel: 0 }),
    */
   private static readonly migrations: Record<number, MigrationStep> = {
-    // (no migrations yet — current version is 1)
+    // v1 -> v2: the fixed wave system became the endless level system.
+    // Carry the old wave progress forward as level progress, then drop the
+    // legacy fields.
+    1: (data: any) => {
+      const { currentWave, highestWave, ...rest } = data;
+      return {
+        ...rest,
+        version: 2,
+        currentLevel: data.currentLevel ?? currentWave ?? 1,
+        highestLevel: data.highestLevel ?? highestWave ?? 0,
+      };
+    },
   };
 
   static get currentVersion(): number {
