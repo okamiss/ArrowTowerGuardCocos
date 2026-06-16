@@ -13,6 +13,7 @@ Only reusable pure logic was migrated — no airplane demo code, no `game.js`/`g
 | `economy/` | `Wallet.ts` |
 | `upgrades/` | `UpgradeSystem.ts` |
 | `cocos/` | `GameSceneController.ts` (the only Cocos-coupled file: builds the first screen) |
+| `art/` | `AssetConfig.ts` (all art paths + fallback colors, no `cc` dep), `AssetLoader.ts` (loads SpriteFrames from `resources`, falls back to the Graphics placeholder) |
 | `battle/` | (empty — reserved for battle logic) |
 
 `LocalSaveService` now uses Cocos `sys.localStorage`, so gold/upgrades persist in **browser
@@ -40,6 +41,39 @@ cloud swap.
 1. Click **+100 Gold (debug)** a few times → `Gold:` rises (and it saves).
 2. Stop and Preview again → gold is still there (loaded from `sys.localStorage`).
 3. Click **Buy Damage** → spends 50 gold, `Damage Lv.` increments, persists.
+
+## Art assets (Sprite system)
+
+The scene renders **Graphics-color placeholders today** and upgrades them to real
+Sprites the moment matching PNGs exist — **no gameplay-code changes needed**.
+
+- All paths + fallback colors live in `assets/scripts/art/AssetConfig.ts`
+  (colors reference `GameConfig.colors` / `GameConfig.monsters` — one source of truth).
+- `AssetLoader.applyTo(node, asset)` tries `resources.load('<path>/spriteFrame', SpriteFrame)`.
+  On success it swaps the Graphics placeholder for a Sprite; on failure the
+  placeholder stays. Misses are cached, so this is cheap.
+- The game runs with the `assets/resources/art/` folders **empty**.
+
+### Add real PNG art later (no code changes)
+
+1. Drop a PNG into the folder matching its `AssetConfig` `path`, e.g.
+   `AssetConfig.tower.castle.path = 'art/tower/castle'` → save the file as
+   **`assets/resources/art/tower/castle.png`**.
+2. Cocos auto-imports it. In the **Inspector**, confirm the image **Type** is
+   `sprite-frame` (the default for a plain PNG).
+3. Press **Preview** — the loader finds `art/tower/castle/spriteFrame` and the
+   castle now shows your art. The Sprite uses **CUSTOM** size mode, so it keeps
+   the placeholder's on-screen size and position.
+
+| Asset (`AssetConfig.*`)        | Drop PNG at                                   |
+|--------------------------------|-----------------------------------------------|
+| `background.field` / `.ground` | `assets/resources/art/background/field.png`, `ground.png` |
+| `tower.castle/tower/archer/arrow` | `assets/resources/art/tower/*.png`         |
+| `enemy.goblin/bat/brute/overlord` | `assets/resources/art/enemy/*.png`         |
+| `ui.button` / `ui.spawnZone`   | `assets/resources/art/ui/button.png`, `spawn_zone.png` |
+
+> The folder must stay named **`resources`** (Cocos requirement for dynamic
+> `resources.load`). Do not move `art/` out of it.
 
 ## Build for WeChat (later)
 

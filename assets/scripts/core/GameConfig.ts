@@ -141,13 +141,17 @@ export const GameConfig = {
     backend: 'local' as 'local' | 'cloud',
   },
 
-  /** Misc placeholder-art colors. */
+  /** Misc placeholder-art colors. SINGLE SOURCE OF TRUTH for fallback tints —
+   *  AssetConfig.ts references these; do not hard-code colors elsewhere. */
   colors: {
     background: '#3a4a2e',
+    ground: '#2c3a22',
     castle: '#7d7d85',
     tower: '#9a9aa2',
     hero: '#d8c45a',
     arrow: '#e8e0c0',
+    spawnZone: '#b03030',
+    button: '#4a5a3a',
     damageNormal: '#ffffff',
     damageCrit: '#ffd23f',
   },

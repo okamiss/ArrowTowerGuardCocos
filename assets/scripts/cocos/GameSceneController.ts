@@ -29,6 +29,9 @@ import type { PlayerSaveData } from '../save/PlayerSaveData';
 import { Wallet } from '../economy/Wallet';
 import { UpgradeSystem } from '../upgrades/UpgradeSystem';
 import { TOTAL_WAVES } from '../core/GameConfig';
+import { AssetConfig } from '../art/AssetConfig';
+import type { SpriteAsset } from '../art/AssetConfig';
+import { AssetLoader } from '../art/AssetLoader';
 
 const { ccclass } = _decorator;
 
@@ -87,19 +90,19 @@ export class GameSceneController extends Component {
     const { hw, hh } = this;
     const groundTopY = -hh + 200; // ground band is 200px tall at the bottom
 
-    this.addRect(0, 0, hw * 2, hh * 2, color(58, 74, 46)); // background
-    this.addRect(0, (-hh + groundTopY) / 2, hw * 2, groundTopY - -hh, color(44, 58, 34)); // ground
+    this.addArt(AssetConfig.background.field, 0, 0, hw * 2, hh * 2); // background
+    this.addArt(AssetConfig.background.ground, 0, (-hh + groundTopY) / 2, hw * 2, groundTopY - -hh); // ground
 
     // Enemy spawn zone (right) + placeholder monster.
     const zoneW = Math.min(180, hw * 0.28);
-    this.addRect(hw - zoneW / 2, (groundTopY + hh) / 2, zoneW, hh - groundTopY, color(176, 48, 48, 46));
-    this.addRect(hw - zoneW / 2, groundTopY + 25, 32, 50, color(111, 174, 84));
+    this.addArt(AssetConfig.ui.spawnZone, hw - zoneW / 2, (groundTopY + hh) / 2, zoneW, hh - groundTopY);
+    this.addArt(AssetConfig.enemy.goblin, hw - zoneW / 2, groundTopY + 25, 32, 50);
     this.addLabel('ENEMY SPAWN', hw - zoneW / 2, hh - 30, 16, color(255, 255, 255), Label.HorizontalAlign.CENTER);
 
     // Castle + tower + archer (left).
-    this.addRect(-hw + 85, groundTopY + 75, 90, 150, color(125, 125, 133));
-    this.addRect(-hw + 145, groundTopY + 110, 46, 200, color(154, 154, 162));
-    this.addRect(-hw + 168, groundTopY + 215, 30, 30, color(216, 196, 90));
+    this.addArt(AssetConfig.tower.castle, -hw + 85, groundTopY + 75, 90, 150);
+    this.addArt(AssetConfig.tower.tower, -hw + 145, groundTopY + 110, 46, 200);
+    this.addArt(AssetConfig.tower.archer, -hw + 168, groundTopY + 215, 30, 30);
   }
 
   private buildHud(): void {
@@ -149,6 +152,19 @@ export class GameSceneController extends Component {
 
   // --- tiny UI helpers -----------------------------------------------------
 
+  /**
+   * Place a piece of art. Draws the Graphics-color placeholder immediately
+   * (current look), then asks AssetLoader to swap in a real SpriteFrame if a PNG
+   * exists for this asset. The fill color comes from AssetConfig -> GameConfig,
+   * so no colors are hard-coded here.
+   */
+  private addArt(asset: SpriteAsset, x: number, y: number, w: number, h: number): Node {
+    const fill = hexToColor(asset.fallbackColor, asset.alpha ?? 255);
+    const node = this.addRect(x, y, w, h, fill);
+    AssetLoader.applyTo(node, asset);
+    return node;
+  }
+
   /** A solid-color rectangle node (its own Graphics, single color). */
   private addRect(x: number, y: number, w: number, h: number, fill: Color): Node {
     const node = new Node('rect');
@@ -185,9 +201,11 @@ export class GameSceneController extends Component {
     node.layer = Layers.Enum.UI_2D;
     node.addComponent(UITransform).setContentSize(w, h);
     const g = node.addComponent(Graphics);
-    g.fillColor = color(74, 90, 58);
+    g.fillColor = hexToColor(AssetConfig.ui.button.fallbackColor);
     g.roundRect(-w / 2, -h / 2, w, h, 8);
     g.fill();
+    // Swap in real button art if a PNG exists; otherwise the rounded placeholder stays.
+    AssetLoader.applyTo(node, AssetConfig.ui.button);
 
     const labelNode = new Node('label');
     labelNode.layer = Layers.Enum.UI_2D;
@@ -210,5 +228,14 @@ export class GameSceneController extends Component {
 
 /** Color helper (0-255 channels). */
 function color(r: number, g: number, b: number, a = 255): Color {
+  return new Color(r, g, b, a);
+}
+
+/** Parse a `#rrggbb` hex string (from AssetConfig/GameConfig) into a Color. */
+function hexToColor(hex: string, a = 255): Color {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
   return new Color(r, g, b, a);
 }
