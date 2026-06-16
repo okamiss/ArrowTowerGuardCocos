@@ -12,6 +12,15 @@
 
 // ----- Types ---------------------------------------------------------------
 
+/**
+ * Monster identifier. This is a closed union for typo-safety (the spawn loop
+ * never hard-codes ids — it reads them from `waveMonsterRules`). To add a NEW
+ * monster you extend in exactly three places, all in this file:
+ *   1) add its id to this union,
+ *   2) add its base stats to `GameConfig.monsters`,
+ *   3) reference it from `GameConfig.levelConfigs.waveMonsterRules`.
+ * No gameplay/spawning code needs to change.
+ */
 export type MonsterId = 'goblin' | 'bat' | 'brute' | 'overlord';
 export type UpgradeId = 'damage' | 'attackSpeed' | 'crit' | 'castleHp';
 export type Lane = 'ground' | 'air';
@@ -29,25 +38,54 @@ export interface MonsterConfig {
   readonly isBoss?: boolean;
 }
 
-/** A combo of monster types unlocked once the player reaches `unlockLevel`. */
-export interface MonsterGroup {
-  readonly unlockLevel: number;            // 1-based level this combo becomes active
-  readonly monsters: ReadonlyArray<MonsterId>;
+/**
+ * One AUTHORED spawn entry inside a wave rule (designer-facing). Counts and
+ * cadence are the *base* values; per-level growth is applied later by
+ * `buildWaveSpawns()`. `spawnInterval` / `startDelay` are optional — they fall
+ * back to `levelConfigs.defaultSpawnInterval` / `0`.
+ */
+export interface WaveMonsterSpawn {
+  readonly type: MonsterId;          // which monster (must exist in GameConfig.monsters)
+  readonly count: number;            // base instances of this monster in the wave
+  readonly isBoss?: boolean;         // true => spawns exactly once, never count-scaled
+  readonly spawnInterval?: number;   // seconds between this group's individual spawns
+  readonly startDelay?: number;      // seconds after the wave begins before this group starts
 }
 
 /**
- * One resolved spawn entry: a monster type, how many to spawn, and the
- * level-scaled stats each instance should carry. `buildLevelPlan()` produces
- * these so the spawner stays a dumb pump (no difficulty math in MonsterSpawner).
+ * A rule covering a BAND of waves (`waveFrom`..`waveTo`, inclusive, 1-based
+ * within a level). Every wave in the band spawns the listed monsters. This is
+ * what replaces the old unlock-by-level `monsterGroups`: spawning is now driven
+ * by the wave number, not the level number.
+ */
+export interface WaveMonsterRule {
+  readonly waveFrom: number;
+  readonly waveTo: number;
+  readonly monsters: ReadonlyArray<WaveMonsterSpawn>;
+}
+
+/** The wave-driven spawn config for a level: how many waves + the band rules. */
+export interface LevelWaveConfig {
+  readonly wavesPerLevel: number;
+  readonly waveMonsterRules: ReadonlyArray<WaveMonsterRule>;
+}
+
+/**
+ * One RESOLVED spawn group: a monster type, how many to spawn, the level-scaled
+ * stats each instance carries, and this group's own cadence. `buildWaveSpawns()`
+ * produces these so the spawner stays a dumb pump (no difficulty math in
+ * MonsterSpawner).
  */
 export interface ResolvedSpawn {
   readonly id: MonsterId;
   readonly count: number;
   readonly hp: number;             // per-instance HP after level scaling
   readonly gold: number;           // per-instance gold after level scaling
-  readonly castleDamage: number;   // per-instance castle damage
+  readonly castleDamage: number;   // per-instance castle damage after level scaling
   readonly speed: number;          // px/s
   readonly isBoss: boolean;
+  readonly spawnInterval: number;  // seconds between this group's individual spawns
+  readonly startDelay: number;     // seconds after the wave begins before this group starts
 }
 
 /**
@@ -102,7 +140,7 @@ export const GameConfig = {
     castleHitX: 200,     // x where a monster "reaches" the castle
     groundY: 160,        // ground-lane Y
     airY: 320,           // air-lane Y (flyers)
-    towerMuzzle: { x: 180, y: 260 }, // where arrows launch from
+    towerMuzzle: { x: 150, y: 470 }, // archer atop the wall; where arrows launch from
   },
 
   /**
@@ -176,54 +214,88 @@ export const GameConfig = {
   } as Record<MonsterId, MonsterConfig>,
 
   /**
-   * Level system (replaces the old fixed 10-wave table). Levels are generated
-   * procedurally from these knobs by `buildLevelPlan(level)`:
-   *   - which monster combo is active (monsterGroups, by unlockLevel),
-   *   - how many monsters / how fast they spawn (base + difficultyGrowth),
-   *   - whether a boss appears (every `bossInterval` levels).
-   * The run is endless; there is no victory cap.
+   * Level system. The number of waves per level GROWS with the level (see
+   * `getWavesPerLevel`): 5 waves early, ramping to a 10-wave cap. What spawns in
+   * each NORMAL wave is driven by `waveMonsterRules` (BY WAVE NUMBER, not by
+   * level). A BOSS appears only on boss levels (`isBossLevel`, every
+   * `bossLevelInterval` levels) and only on that level's FINAL wave
+   * (`isBossWave`) — the boss is injected by `buildWaveSpawns`, never authored
+   * into `waveMonsterRules`.
+   *
+   * `buildLevelPlan(level)` walks waves 1..getWavesPerLevel(level) and, for each,
+   * calls `buildWaveSpawns(level, wave)` which:
+   *   - on a boss wave: spawns ONLY the boss (count 1), unless `bossWaveKeepsMinions`,
+   *   - otherwise: looks up the wave-band rule and applies per-LEVEL growth
+   *     (difficultyGrowth) to count / hp / gold / castle damage.
+   *
+   * To retune the wave RAMP, edit `baseWavesPerLevel` / `wavesStepLevels` /
+   * `maxWavesPerLevel`. To change boss cadence, edit `bossLevelInterval`. To
+   * change which monsters appear when, edit `waveMonsterRules`. The spawn loop
+   * itself contains no balance numbers.
    */
   levelConfigs: {
-    wavesPerLevel: 10,             // every level has exactly 10 waves
-    waveInterval: 8,               // seconds between successive wave START times
+    // --- wave-count ramp: getWavesPerLevel(L) = min(base + floor((L-1)/step), max) ---
+    baseWavesPerLevel: 5,          // waves on levels 1..wavesStepLevels
+    wavesStepLevels: 5,            // +1 wave every this many levels
+    maxWavesPerLevel: 10,          // hard cap on waves per level
+
+    waveInterval: 8,               // seconds between successive wave START times (time pressure)
     levelCompleteDelay: 0.5,       // grace period after the field empties before completing
-    baseMonstersPerWave: 3,        // normal monsters per wave on level 1, wave 1
-    baseSpawnInterval: 1.10,       // seconds between individual spawns on level 1
-    minSpawnInterval: 0.55,        // floor as levels speed up
-    spawnIntervalDecayPerLevel: 0.015,
-    eliteHpMultiplier: 1.5,        // HP bump for the elite final wave (non-boss levels)
-    bossInterval: 10,              // a boss appears on every Nth level (in its final wave)
+    defaultSpawnInterval: 0.9,     // fallback cadence when a rule omits `spawnInterval`
+
+    // --- boss cadence & definition ---
+    bossLevelInterval: 5,          // a boss level occurs every Nth level (5, 10, 15, ...)
+    bossWaveKeepsMinions: false,   // true => a boss wave ALSO spawns its normal-band monsters
+    boss: {
+      type: 'overlord' as MonsterId, // which monster is the boss (must exist in `monsters`)
+      spawnInterval: 1.0,          // unused for a single boss, kept for symmetry
+      startDelay: 2,               // seconds after the boss wave begins before the boss enters
+    },
+
     /**
-     * Monster combos by unlock level (the highest unlockLevel ≤ the current
-     * level wins). Drives "1-4 base only / 5 new combo / 15 stronger combo".
+     * Per-wave spawn rules for NORMAL (non-boss) waves. A wave's monsters are
+     * chosen by matching its number against `waveFrom`..`waveTo`. Bands cover
+     * waves 1..maxWavesPerLevel so any reachable wave resolves:
+     *   waves 1-3  -> base only,
+     *   waves 4-6  -> base + mid,
+     *   waves 7-10 -> base + mid + high.
+     * Counts/cadence are BASE values; per-level growth is layered on at runtime.
+     * Do NOT put bosses here — bosses are injected on boss waves automatically.
      */
-    monsterGroups: [
-      { unlockLevel: 1,  monsters: ['goblin'] },
-      { unlockLevel: 5,  monsters: ['goblin', 'bat'] },
-      { unlockLevel: 15, monsters: ['goblin', 'bat', 'brute'] },
-    ] as ReadonlyArray<MonsterGroup>,
+    waveMonsterRules: [
+      {
+        waveFrom: 1, waveTo: 3,
+        monsters: [
+          { type: 'goblin', count: 5, spawnInterval: 0.8 },
+        ],
+      },
+      {
+        waveFrom: 4, waveTo: 6,
+        monsters: [
+          { type: 'goblin', count: 5, spawnInterval: 0.7 },
+          { type: 'bat',    count: 3, spawnInterval: 1.2, startDelay: 2 },
+        ],
+      },
+      {
+        waveFrom: 7, waveTo: 10,
+        monsters: [
+          { type: 'goblin', count: 5, spawnInterval: 0.6 },
+          { type: 'bat',    count: 3, spawnInterval: 1.0, startDelay: 1 },
+          { type: 'brute',  count: 2, spawnInterval: 2.0, startDelay: 3 },
+        ],
+      },
+    ] as ReadonlyArray<WaveMonsterRule>,
   },
 
-  /** Boss tuning. A boss (the `overlord` monster) appears every bossInterval
-   *  levels; these base stats are scaled by level in `buildLevelPlan`. */
-  bossConfigs: {
-    id: 'overlord' as MonsterId,
-    baseHp: 1800,
-    baseGold: 250,
-    baseCastleDamage: 60,
-    baseSpeed: 25,
-  },
-
-  /** Difficulty growth (linear fractions of the base values). Per-level scales
-   *  across levels; per-wave scales across the 10 waves within a level so later
-   *  waves pile on more pressure. */
+  /** Difficulty growth — per-LEVEL fractions of the base values (waves within a
+   *  level differ by their RULE, not by procedural per-wave scaling). Applied by
+   *  `levelGrowth()`; nothing else hard-codes these curves. */
   difficultyGrowth: {
-    hpGrowthPerLevel: 0.12,        // +12% monster HP per level past level 1
-    hpGrowthPerWave: 0.04,         // +4% monster HP per wave within a level
-    countGrowthPerLevel: 0.4,      // +0.4 monsters/wave per level (rounded)
-    countGrowthPerWave: 0.25,      // +0.25 monsters per wave within a level (rounded)
-    goldGrowthPerLevel: 0.08,      // +8% gold reward per level past level 1
-    bossHpGrowthPerLevel: 0.25,    // +25% boss HP per boss tier (per 10 levels)
+    hpGrowthPerLevel: 0.12,           // +12% normal-monster HP per level past 1
+    goldGrowthPerLevel: 0.08,         // +8%  gold reward per level past 1
+    countGrowthPerLevel: 0.10,        // +10% monster COUNT per level past 1 (boss excluded)
+    castleDamageGrowthPerLevel: 0.05, // +5%  monster castle damage per level past 1
+    bossHpGrowthPerLevel: 0.20,       // +20% boss HP per level past 1
   },
 
   /**
@@ -288,117 +360,170 @@ export function upgradeCost(id: UpgradeId, level: number): number {
   return Math.floor(c.baseCost * Math.pow(c.growth, level));
 }
 
-/** The monster combo active at `level` (highest unlockLevel ≤ level). */
-function activeMonsterGroup(level: number): ReadonlyArray<MonsterId> {
-  const groups = GameConfig.levelConfigs.monsterGroups;
-  let active = groups[0].monsters;
-  for (const g of groups) {
-    if (level >= g.unlockLevel) active = g.monsters;
-  }
-  return active;
+/** Per-LEVEL difficulty multipliers, resolved once per level. ENCAPSULATES all
+ *  growth math so `buildWaveSpawns()` stays a flat resolve loop with no inline
+ *  balance numbers. Tune the curves in `GameConfig.difficultyGrowth`. */
+interface LevelGrowth {
+  readonly hpMul: number;          // normal-monster HP scale
+  readonly goldMul: number;        // gold-reward scale
+  readonly countMul: number;       // normal-monster count scale (boss excluded)
+  readonly castleDamageMul: number;// monster castle-damage scale
+  readonly bossHpMul: number;      // boss HP scale (separate curve)
 }
 
-/** Distribute `total` monsters across `group`, weaker types first; level-scaled. */
-function distributeWave(
-  group: ReadonlyArray<MonsterId>,
-  total: number,
-  hpMul: number,
-  goldMul: number,
-): ResolvedSpawn[] {
-  const per = Math.floor(total / group.length);
-  let remainder = total - per * group.length;
+function levelGrowth(level: number): LevelGrowth {
+  const dg = GameConfig.difficultyGrowth;
+  const past = Math.max(0, Math.floor(level) - 1); // levels grown past level 1
+  return {
+    hpMul: 1 + past * dg.hpGrowthPerLevel,
+    goldMul: 1 + past * dg.goldGrowthPerLevel,
+    countMul: 1 + past * dg.countGrowthPerLevel,
+    castleDamageMul: 1 + past * dg.castleDamageGrowthPerLevel,
+    bossHpMul: 1 + past * dg.bossHpGrowthPerLevel,
+  };
+}
+
+/**
+ * How many waves level `L` (1-based) has. Waves RAMP with the level:
+ *   getWavesPerLevel(L) = min(base + floor((L-1)/step), max)
+ * With the default config (base 5, step 5, max 10):
+ *   levels 1-5 -> 5, 6-10 -> 6, 11-15 -> 7, 16-20 -> 8, 21-25 -> 9, 26+ -> 10.
+ * This is the SINGLE source of the per-level wave count — never hard-code 10.
+ */
+export function getWavesPerLevel(level: number): number {
+  const lc = GameConfig.levelConfigs;
+  const L = Math.max(1, Math.floor(level));
+  return Math.min(lc.baseWavesPerLevel + Math.floor((L - 1) / lc.wavesStepLevels), lc.maxWavesPerLevel);
+}
+
+/** True if `level` is a boss level (every `bossLevelInterval`-th: 5, 10, 15, ...). */
+export function isBossLevel(level: number): boolean {
+  return Math.floor(level) % GameConfig.levelConfigs.bossLevelInterval === 0;
+}
+
+/** True if (level, wave) is THE boss wave: a boss level's FINAL wave. The boss
+ *  never appears anywhere else, and a non-boss level has no boss wave at all. */
+export function isBossWave(level: number, wave: number): boolean {
+  return isBossLevel(level) && Math.floor(wave) === getWavesPerLevel(level);
+}
+
+/**
+ * The spawn rule covering NORMAL wave `wave` (1-based), or `null` if no band
+ * matches. Lookup is BY WAVE NUMBER only (independent of level) — this is the
+ * single place the wave -> normal-monsters mapping is resolved. Bosses are NOT
+ * in these rules (see `makeBossSpawn`).
+ */
+export function getWaveMonsterRule(wave: number): WaveMonsterRule | null {
+  const w = Math.floor(wave);
+  for (const rule of GameConfig.levelConfigs.waveMonsterRules) {
+    if (w >= rule.waveFrom && w <= rule.waveTo) return rule;
+  }
+  return null;
+}
+
+/** The level-scaled boss spawn (count forced to 1, scaled on the boss HP curve). */
+function makeBossSpawn(level: number): ResolvedSpawn {
+  const bc = GameConfig.levelConfigs.boss;
+  const base = GameConfig.monsters[bc.type];
+  const g = levelGrowth(level);
+  return {
+    id: bc.type,
+    count: 1, // bosses are always exactly one
+    hp: Math.max(1, Math.round(base.hp * g.bossHpMul)),
+    gold: Math.max(1, Math.round(base.gold * g.goldMul)),
+    castleDamage: Math.max(1, Math.round(base.castleDamage * g.castleDamageMul)),
+    speed: base.speed,
+    isBoss: true,
+    spawnInterval: bc.spawnInterval,
+    startDelay: Math.max(0, bc.startDelay),
+  };
+}
+
+/**
+ * Resolve the FINAL list of monster groups to spawn for (level, wave). This is
+ * the single seam where boss logic + level scaling live — the spawner and
+ * `buildLevelPlan` never do balance math.
+ *
+ * Boss waves take PRIORITY: on a boss wave only the boss spawns (count 1),
+ * unless `bossWaveKeepsMinions` is set — then the normal band spawns too.
+ * Normal waves resolve their wave-band rule and apply per-LEVEL growth
+ * (count / hp / gold / castle damage). Output is ordered normal-first, boss-last.
+ */
+export function buildWaveSpawns(level: number, wave: number): ResolvedSpawn[] {
+  const L = Math.max(1, Math.floor(level));
+  const w = Math.floor(wave);
+  const lc = GameConfig.levelConfigs;
+  const bossWave = isBossWave(L, w);
 
   const out: ResolvedSpawn[] = [];
-  for (const id of group) {
-    const count = per + (remainder > 0 ? 1 : 0);
-    if (remainder > 0) remainder--;
-    if (count <= 0) continue;
-    const base = GameConfig.monsters[id];
-    out.push({
-      id,
-      count,
-      hp: Math.max(1, Math.round(base.hp * hpMul)),
-      gold: Math.max(1, Math.round(base.gold * goldMul)),
-      castleDamage: base.castleDamage,
-      speed: base.speed,
-      isBoss: false,
-    });
-  }
-  return out;
-}
 
-/** The boss spawn for level `L`, scaled by the level HP curve and the boss tier. */
-function makeBossSpawn(L: number, hpMul: number, goldMul: number): ResolvedSpawn {
-  const bc = GameConfig.bossConfigs;
-  const dg = GameConfig.difficultyGrowth;
-  const bossTier = Math.floor(L / GameConfig.levelConfigs.bossInterval); // 1 at L=10, 2 at L=20
-  const bossHp = Math.round(bc.baseHp * hpMul * (1 + dg.bossHpGrowthPerLevel * (bossTier - 1)));
-  return {
-    id: bc.id,
-    count: 1,
-    hp: Math.max(1, bossHp),
-    gold: Math.round(bc.baseGold * goldMul),
-    castleDamage: bc.baseCastleDamage,
-    speed: bc.baseSpeed,
-    isBoss: true,
-  };
+  // Normal monsters: present on every normal wave, and on a boss wave only if
+  // minions are explicitly allowed.
+  if (!bossWave || lc.bossWaveKeepsMinions) {
+    const rule = getWaveMonsterRule(w);
+    if (rule) {
+      const g = levelGrowth(L);
+      const def = lc.defaultSpawnInterval;
+      for (const m of rule.monsters) {
+        if (m.isBoss) continue; // bosses are injected below, never from rules
+        const base = GameConfig.monsters[m.type];
+        if (!base) continue; // unknown id (mis-typed rule): skip defensively, never crash
+        out.push({
+          id: m.type,
+          count: Math.max(1, Math.round(m.count * g.countMul)),
+          hp: Math.max(1, Math.round(base.hp * g.hpMul)),
+          gold: Math.max(1, Math.round(base.gold * g.goldMul)),
+          castleDamage: Math.max(1, Math.round(base.castleDamage * g.castleDamageMul)),
+          speed: base.speed,
+          isBoss: false,
+          spawnInterval: m.spawnInterval ?? def,
+          startDelay: Math.max(0, m.startDelay ?? 0),
+        });
+      }
+    }
+  }
+
+  if (bossWave) out.push(makeBossSpawn(L)); // boss always last
+
+  return out;
 }
 
 /**
  * Build the fully-resolved plan for `level` (1-based). Pure & Cocos-free, so it
  * is unit-testable and the spawner needs no difficulty math.
  *
- * Structure: a level has `wavesPerLevel` waves that start on a TIME schedule —
- * wave `w` begins at `(w-1) * waveInterval` seconds after the level starts,
- * regardless of whether earlier waves are cleared. The level finishes only once
- * every wave has been spawned AND the field is empty (BattleManager enforces).
+ * Structure: the level has `getWavesPerLevel(level)` waves that start on a TIME
+ * schedule — wave `w` begins at `(w-1) * waveInterval` seconds after the level
+ * starts, regardless of whether earlier waves are cleared (the time-pressure
+ * model). The level finishes only once every wave has been spawned AND the field
+ * is empty (BattleManager enforces).
  *
- * Difficulty rules:
- *   - monster HP / count grow both per level and per wave (later waves harder),
- *   - levels 1-4 spawn only the base combo; level 5 unlocks a new combo;
- *     level 15 unlocks a stronger combo,
- *   - the final wave of every level is an "elite" wave (tougher); on every
- *     `bossInterval`-th level (10, 20, ...) the final wave is a BOSS wave.
+ * WHAT spawns per wave comes entirely from `buildWaveSpawns(level, w)` — i.e.
+ * normal-band rules + per-level growth, plus the boss on the boss wave. Nothing
+ * here hard-codes monster types, counts, or the wave count.
  */
 export function buildLevelPlan(level: number): LevelPlan {
   const L = Math.max(1, Math.floor(level));
   const lc = GameConfig.levelConfigs;
-  const dg = GameConfig.difficultyGrowth;
-
-  const goldMul = 1 + (L - 1) * dg.goldGrowthPerLevel;
-  const spawnInterval = Math.max(lc.minSpawnInterval, lc.baseSpawnInterval - (L - 1) * lc.spawnIntervalDecayPerLevel);
-  const group = activeMonsterGroup(L);
-  const totalWaves = lc.wavesPerLevel;
-  const levelHasBoss = L % lc.bossInterval === 0;
+  const totalWaves = getWavesPerLevel(L);
 
   const waves: WavePlan[] = [];
   for (let w = 1; w <= totalWaves; w++) {
-    const isEliteWave = w === totalWaves;
-    const isBossWave = isEliteWave && levelHasBoss;
-
-    // HP / count scale with both the level and the wave (later waves pile on).
-    const waveHpMul = 1 + (L - 1) * dg.hpGrowthPerLevel + (w - 1) * dg.hpGrowthPerWave;
-    const hpMul = isEliteWave && !isBossWave ? waveHpMul * lc.eliteHpMultiplier : waveHpMul;
-    const perWave = Math.max(
-      1,
-      Math.round(lc.baseMonstersPerWave + (L - 1) * dg.countGrowthPerLevel + (w - 1) * dg.countGrowthPerWave),
-    );
-
-    const spawns = distributeWave(group, perWave, hpMul, goldMul);
-    if (isBossWave) spawns.push(makeBossSpawn(L, waveHpMul, goldMul));
-
+    const spawns = buildWaveSpawns(L, w);
     const count = spawns.reduce((sum, s) => sum + s.count, 0);
+    const hasBoss = spawns.some((s) => s.isBoss);
     waves.push({
       wave: w,
       startTime: (w - 1) * lc.waveInterval,
       spawns,
-      spawnInterval,
+      spawnInterval: lc.defaultSpawnInterval, // default cadence; groups carry their own
       count,
-      isEliteWave,
-      hasBoss: isBossWave,
+      isEliteWave: w === totalWaves,
+      hasBoss,
     });
   }
 
   const totalCount = waves.reduce((sum, wv) => sum + wv.count, 0);
-  return { level: L, waves, totalWaves, hasBoss: levelHasBoss, totalCount };
+  const hasBoss = waves.some((wv) => wv.hasBoss);
+  return { level: L, waves, totalWaves, hasBoss, totalCount };
 }

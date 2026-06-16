@@ -96,7 +96,7 @@ export class SaveVersionManager {
     // Strip deprecated fields so they are never re-persisted: this version saves
     // only LEVEL progress, never the within-level wave (currentWave/bestWave).
     const { currentWave, bestWave, highestWave, ...rest } = data;
-    return {
+    const merged: PlayerSaveData = {
       ...d,
       ...rest,
       upgrades: { ...d.upgrades, ...(rest.upgrades ?? {}) },
@@ -104,5 +104,17 @@ export class SaveVersionManager {
       stats: { ...d.stats, ...(rest.stats ?? {}) },
       version: SaveVersionManager.currentVersion,
     };
+    // Bulletproof the progression pointers: a corrupt/NaN currentLevel must never
+    // break load. currentLevel is the SAVED PROGRESS (>= 1); highestLevel is the
+    // best ever reached (>= 0) and is NEVER used as the current level.
+    merged.currentLevel = SaveVersionManager.posInt(merged.currentLevel, 1, 1);
+    merged.highestLevel = SaveVersionManager.posInt(merged.highestLevel, 0, 0);
+    return merged;
+  }
+
+  /** Coerce to an integer >= `min`, falling back to `fallback` if not finite. */
+  private static posInt(v: any, min: number, fallback: number): number {
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) ? Math.max(min, n) : fallback;
   }
 }

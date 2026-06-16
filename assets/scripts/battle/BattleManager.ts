@@ -24,7 +24,7 @@ import {
   _decorator, Component, Node, UITransform, Sprite, SpriteFrame, Layers, Vec3,
   input, Input, EventTouch, EventMouse, director,
 } from 'cc';
-import { GameConfig } from '../core/GameConfig';
+import { GameConfig, getWavesPerLevel } from '../core/GameConfig';
 import type { MonsterId, UpgradeId } from '../core/GameConfig';
 import { eventBus, GameEvent } from '../core/EventBus';
 import { Wallet } from '../economy/Wallet';
@@ -330,29 +330,36 @@ export class BattleManager extends Component {
 
   /**
    * Every monster for the current level is dead. Stop spawning, pause the battle,
-   * persist progress, and show the upgrade overlay. (currentLevel advances only
-   * when the player taps "continue".)
+   * and BANK the clear immediately: advance currentLevel (+ highestLevel) and
+   * persist NOW — not on "continue" — so a player who quits on the upgrade panel
+   * resumes at the NEXT level and never replays the cleared one. The upgrade
+   * overlay still shows the level that was just cleared.
    */
   private onLevelComplete(): void {
     if (this.over || this.paused) return;
     this.paused = true;
     this.firing = false;
     this.spawner.stop();
+
+    const clearedLevel = this.levelManager.currentLevel;
+    this.levelManager.nextLevel();        // currentLevel += 1, highestLevel = max(...)
     this.profile.gold = this.wallet.getGold();
-    this.flushSave('level-clear');
-    this.showUpgradePanel();
-    console.log(`[BattleManager] level ${this.levelManager.currentLevel} CLEARED`);
+    this.flushSave('level-clear');        // persist currentLevel / highestLevel / gold now
+
+    this.showUpgradePanel(clearedLevel);
+    console.log(`[BattleManager] level ${clearedLevel} CLEARED -> resume at ${this.levelManager.currentLevel}`);
   }
 
-  /** Build and display the between-level upgrade + continue overlay. */
-  showUpgradePanel(): void {
+  /** Build and display the between-level upgrade + continue overlay.
+   *  @param clearedLevel the level the player just finished (for the title). */
+  showUpgradePanel(clearedLevel: number): void {
     const node = new Node('UpgradePanel');
     node.layer = Layers.Enum.UI_2D;
     this.node.addChild(node);
     this.upgradePanelNode = node;
     this.upgradePanel = node.addComponent(UpgradePanel);
     this.upgradePanel.show({
-      level: this.levelManager.currentLevel,
+      level: clearedLevel,
       getGold: () => this.wallet.getGold(),
       getRows: () => this.buildUpgradeRows(),
       onBuy: (id) => this.buyUpgrade(id),
@@ -385,11 +392,12 @@ export class BattleManager extends Component {
     this.saveDirty = true;                       // coalesced; the level-clear flush also covers it
   }
 
-  /** Player tapped "continue": advance, refill the castle, persist, next level. */
+  /**
+   * Player tapped "continue". currentLevel was ALREADY advanced + persisted in
+   * onLevelComplete (banking-on-clear), so here we only refill the castle for the
+   * upgraded stats and begin the already-current level.
+   */
   private continueToNextLevel(): void {
-    this.levelManager.nextLevel(); // bumps profile.currentLevel + highestLevel
-    this.flushSave('next-level');  // persist currentLevel / highestLevel immediately
-
     // Refill the castle to its (possibly upgraded) max HP for the new level.
     this.stats = this.upgrades.computeStats();
     this.castle = new Castle(this.stats.castleMaxHp); // emits CastleHpChanged -> HUD
@@ -420,10 +428,10 @@ export class BattleManager extends Component {
   }
 
   /**
-   * Current WAVE (波) within the level, 1..wavesPerLevel.
+   * Current WAVE (波) within the level, 1..getWavesPerLevel(level).
    *
    * Save policy: only LEVEL progress is persisted, never the within-level wave.
-   * On re-entry the battle restarts the saved level at wave 1/10. This value is
+   * On re-entry the battle restarts the saved level at wave 1. This value is
    * runtime-only state owned by WaveManager (via LevelManager.currentWaveInLevel)
    * — it is read here for display, never loaded from / written to the save.
    */
@@ -431,9 +439,9 @@ export class BattleManager extends Component {
     return this.levelManager?.currentWaveInLevel ?? 1;
   }
 
-  /** Waves per level (default 10). */
+  /** Total waves of the current level (RAMPS with the level; never a fixed 10). */
   getWavesPerLevel(): number {
-    return this.levelManager?.wavesPerLevel ?? GameConfig.levelConfigs.wavesPerLevel;
+    return this.levelManager?.wavesPerLevel ?? getWavesPerLevel(this.getCurrentLevel());
   }
 
   getCurrentGold(): number {
@@ -708,8 +716,17 @@ export class BattleManager extends Component {
     this.addSprite(AssetConfig.background.ground, 0, (-HALF_H + groundY) / 2, HALF_W * 2, groundY + HALF_H);
 
     // Castle + archer (left), positioned from layout config.
-    const castleX = GameConfig.layout.castleHitX - HALF_W;
-    this.addSprite(AssetConfig.tower.castle, castleX - 20, groundY + 90, 120, 180);
+    // The wall is flush against the screen's left edge; its right face lands on
+    // the collision line (castleHitX) so the visual and the hit test agree.
+    const castleRightX = GameConfig.layout.castleHitX - HALF_W; // centered X of the wall's right face
+    const castleW = castleRightX - -HALF_W;                     // span: left edge -> hit line
+    const castleH = 360;                                        // tall wall (rises from the ground)
+    this.addSprite(
+      AssetConfig.tower.castle,
+      -HALF_W + castleW / 2, // center X => left edge flush with the screen
+      groundY + castleH / 2, // bottom sits on the ground lane
+      castleW, castleH,
+    );
     this.addSprite(
       AssetConfig.tower.archer,
       GameConfig.layout.towerMuzzle.x - HALF_W,

@@ -50,10 +50,11 @@ export interface PlayerSaveData {
   /** Level the player is currently on / will resume at. */
   currentLevel: number;
   // NOTE: only LEVEL progress is persisted — never the within-level wave.
-  // On re-entry the battle always restarts the saved level at wave 1/10. The
-  // live wave (WaveManager.currentWave / LevelManager.currentWaveInLevel) is
-  // runtime-only state and is intentionally NOT stored here. Legacy saves may
-  // still carry a `currentWave`; it is ignored on load (see SaveVersionManager).
+  // On re-entry the battle always restarts the saved level at wave 1 (the total
+  // wave count ramps with the level — see GameConfig.getWavesPerLevel). The live
+  // wave (WaveManager.currentWave / LevelManager.currentWaveInLevel) is runtime-
+  // only state and is intentionally NOT stored here. Legacy saves may still carry
+  // a `currentWave`; it is ignored on load (see SaveVersionManager).
 
   upgrades: UpgradeSaveData;
   skills: SkillSaveData;
